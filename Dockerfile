@@ -23,4 +23,4 @@ ENV TILE_CACHE_DIR=/tmp/wxtiles-cache
 EXPOSE 8080
 
 # Railway provides $PORT; default 8080 for local
-CMD gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --threads 4 --timeout 120 app.server:app
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --threads 4 --timeout 120 app.server:app"]
