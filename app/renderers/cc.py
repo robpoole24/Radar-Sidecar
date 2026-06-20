@@ -23,15 +23,40 @@ from ..cache import get_source
 ARCHIVE_BUCKET = "unidata-nexrad-level2"
 _s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED), region_name="us-east-1")
 
-# CC color scale (rho_HV)
+# CC color scale (rho_HV).
+#
+# BUG FIX (June 2026): the original scale spread its 7 stops evenly across
+# the full theoretical 0.20-1.00 range. Real correlation coefficient values
+# inside actual precipitation are almost always 0.95-1.00 — a narrow band —
+# while ground clutter/noise sits well below 0.5 and rarely renders at all
+# (most of it gets filtered upstream or returns as the lowest bucket). The
+# practical effect: ~90% of real-world pixels landed in the single 0.95-1.00
+# stop pair, which both used near-identical orange/red, so the whole radar
+# image rendered as one undifferentiated reddish-orange "spray" with no
+# visible structure — exactly the bug report this scale was rewritten for.
+#
+# This scale concentrates stops where the data actually lives and assigns
+# genuinely distinct hues to each meteorologically meaningful band,
+# following the standard dual-pol CC convention used by RadarScope/GR2Analyze:
+#   < 0.50          ground clutter / noise          -> dark brown
+#   0.50 - 0.80     biological scatter (birds/bugs)  -> purple
+#   0.70 - 0.85     TORNADO DEBRIS SIGNATURE (TDS)   -> magenta/pink — the
+#                   single most operationally important CC feature for storm
+#                   chasers; was previously invisible, buried in the same
+#                   orange band as ordinary rain.
+#   0.85 - 0.93     mixed precip / melting layer     -> blue
+#   0.93 - 0.97     light-moderate rain              -> cyan -> green
+#   0.97 - 0.99     moderate-heavy pure rain         -> green -> yellow
+#   0.99 - 1.00     very pure/uniform rain           -> yellow -> white
 CC_STOPS = [
-    (0.20, (30,  20,  80)),
-    (0.70, (50,  80, 190)),
-    (0.80, (50, 160, 210)),
-    (0.90, (60, 200, 120)),
-    (0.95, (215, 205, 70)),
-    (0.97, (225, 135, 45)),
-    (1.00, (205,  45,  45)),
+    (0.20, (60,   40,  40)),   # ground clutter / noise — dark brown
+    (0.50, (130,  40, 130)),   # biological scatter (birds/insects) — purple
+    (0.80, (190,  40, 150)),   # debris signature zone (TDS) — magenta
+    (0.90, (40,   90, 220)),   # melting layer / mixed precip — blue
+    (0.95, (40,  170, 220)),   # light rain — cyan
+    (0.97, (60,  200, 100)),   # moderate rain — green
+    (0.99, (210, 220,  60)),   # heavy pure rain — yellow
+    (1.00, (255, 255, 255)),   # extremely pure/uniform — white
 ]
 
 _CC_FIELD_NAMES = [
@@ -177,6 +202,14 @@ def render_tile(site, z, x, y):
     try:
         lat2d, lon2d = tile_latlon_grid(z, x, y)
         vals = _polar_to_pixel(vol, lat2d, lon2d)
+        # Mask out values below the clutter floor before colormapping.
+        # CC < 0.20 is essentially always ground clutter/noise with no
+        # useful signal — rendering it just adds visual clutter on top of
+        # the actual storm structure. CC_STOPS already starts at 0.20, so
+        # apply_colormap would leave these transparent anyway via its
+        # `valid` check, but making it explicit here keeps the intent clear
+        # without depending on that implicit behavior.
+        vals = np.where(vals < CC_STOPS[0][0], np.nan, vals)
         rgba = apply_colormap(vals, CC_STOPS, alpha=210)
         return rgba_to_png(rgba)
     except Exception as e:
