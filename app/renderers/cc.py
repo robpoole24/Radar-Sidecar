@@ -65,6 +65,23 @@ _CC_FIELD_NAMES = [
     "correlation_coefficient",
 ]
 
+# Diagnostic state — every render_tile() failure used to ONLY print() to
+# server logs, which made "CC shows the right site but no data" completely
+# undiagnosable from the browser side (a failed render and "no data here
+# right now" look identical: a transparent tile, HTTP 200). This tracks the
+# most recent failure per site so it can be exposed via a debug endpoint
+# (see server.py: add a route that returns _last_cc_error for inspection).
+_last_cc_error = {}  # { site: { "error": str, "stage": str, "timestamp": float } }
+
+def _record_cc_error(site, stage, exc):
+    import time
+    _last_cc_error[site.upper()] = {
+        "error": str(exc),
+        "error_type": type(exc).__name__,
+        "stage": stage,
+        "timestamp": time.time(),
+    }
+
 
 def _latest_key(site):
     site = site.upper()
@@ -198,6 +215,7 @@ def render_tile(site, z, x, y):
         vol = get_source(f"cc::{site.upper()}", lambda: _load_volume(site))
     except Exception as e:
         print(f"[CC] Load failed for {site}: {e}", flush=True)
+        _record_cc_error(site, "load_volume", e)
         return empty_tile_png()
     try:
         lat2d, lon2d = tile_latlon_grid(z, x, y)
@@ -214,4 +232,15 @@ def render_tile(site, z, x, y):
         return rgba_to_png(rgba)
     except Exception as e:
         print(f"[CC] Render failed {site}/{z}/{x}/{y}: {e}", flush=True)
+        _record_cc_error(site, "render", e)
         return empty_tile_png()
+
+
+def get_last_cc_error(site=None):
+    """Returns the most recent recorded CC failure for a site (or all sites
+    if none given). Intended to be exposed via a debug route in server.py —
+    e.g. GET /tiles/cc/<site>/debug — so "no CC data showing" can actually
+    be diagnosed instead of silently looking like an empty radar area."""
+    if site:
+        return _last_cc_error.get(site.upper())
+    return _last_cc_error
