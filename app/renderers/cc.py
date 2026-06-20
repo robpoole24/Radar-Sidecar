@@ -174,6 +174,30 @@ def _load_volume(site):
 
 
 def _polar_to_pixel(vol, lat2d, lon2d):
+    # BUG FIX (June 2026): the original version used nearest-neighbor
+    # lookup (closest single ray + closest single gate) for every output
+    # pixel. NEXRAD's native data is POLAR, not a uniform grid — gates
+    # along one ray are spaced ~250m apart, but adjacent RAYS are spaced
+    # much farther apart with distance from the radar (e.g. ~800m at
+    # 100km range, ~4km at 460km range, per super-resolution 0.5° azimuth
+    # steps). Any map zoom level finer than that azimuthal spacing —
+    # which is essentially always true once you're more than a few tens of
+    # km from the radar site — causes adjacent output pixels to either
+    # collapse onto the same source ray (visually fine) or fall into the
+    # GAP between two rays and snap unpredictably to whichever one is
+    # marginally closer (visually: fine-grained speckle/noise), even
+    # though the underlying CC values themselves are smooth and real. This
+    # is why far-field stratiform rain — which should render as a clean,
+    # nearly uniform color per our scale — looked grainy and chaotic,
+    # while areas close to the radar (denser ray spacing) looked cleaner.
+    #
+    # Fix: bilinear interpolation across the four surrounding rays/gates
+    # (two nearest azimuths × two nearest ranges) instead of snapping to
+    # one. This smooths the sampling artifact without blurring real
+    # storm structure at a scale larger than the native gate/ray spacing —
+    # a genuine sharp feature (e.g. a debris signature boundary) is still
+    # many gates wide and survives interpolation; what gets smoothed is
+    # only the sub-ray-spacing noise from under-sampling.
     lat0, lon0 = vol["lat0"], vol["lon0"]
     R = 6371000.0
     dlat = np.radians(lat2d - lat0)
@@ -189,24 +213,66 @@ def _polar_to_pixel(vol, lat2d, lon2d):
     data = vol["data"]
 
     out     = np.full(lat2d.shape, np.nan, dtype="float32")
-    inrange = dist <= rng[-1]
+    inrange = (dist <= rng[-1]) & (dist >= rng[0])
     if not inrange.any():
         return out
 
     dist_in = dist[inrange]
     az_in   = azimuth[inrange]
-    ri = np.clip(np.searchsorted(rng, dist_in), 0, len(rng) - 1)
 
+    # ── Range interpolation: find the two bracketing gates and blend ──
+    ri_hi = np.clip(np.searchsorted(rng, dist_in), 1, len(rng) - 1)
+    ri_lo = ri_hi - 1
+    rng_lo, rng_hi = rng[ri_lo], rng[ri_hi]
+    range_denom = np.where(rng_hi != rng_lo, rng_hi - rng_lo, 1.0)
+    range_frac = np.clip((dist_in - rng_lo) / range_denom, 0, 1)
+
+    # ── Azimuth interpolation: find the two bracketing rays and blend ──
+    # Same nearest-azimuth logic as before to locate the closest ray, but
+    # now we also need the SECOND-closest (the other side of the gap) to
+    # interpolate between them, with proper wraparound handling at 0/360.
     az_sorted = np.sort(az)
     sort_idx  = np.argsort(az)
     pos    = np.searchsorted(az_sorted, az_in)
     pos_lo = np.clip(pos - 1, 0, len(az) - 1)
     pos_hi = np.clip(pos,     0, len(az) - 1)
-    diff_lo = np.minimum(np.abs(az_in - az_sorted[pos_lo]), 360.0 - np.abs(az_in - az_sorted[pos_lo]))
-    diff_hi = np.minimum(np.abs(az_in - az_sorted[pos_hi]), 360.0 - np.abs(az_in - az_sorted[pos_hi]))
-    ai = sort_idx[np.where(diff_lo < diff_hi, pos_lo, pos_hi)]
+    az_lo_val = az_sorted[pos_lo]
+    az_hi_val = az_sorted[pos_hi]
+    # Angular distance from az_in to each bracketing ray, accounting for
+    # 0/360 wraparound (e.g. az_in=359, az_lo=358, az_hi=1 should see the
+    # hi gap as 2 degrees, not 358).
+    diff_lo = np.minimum(np.abs(az_in - az_lo_val), 360.0 - np.abs(az_in - az_lo_val))
+    az_gap  = np.minimum(np.abs(az_hi_val - az_lo_val), 360.0 - np.abs(az_hi_val - az_lo_val))
+    az_gap  = np.where(az_gap == 0, 1.0, az_gap)  # avoid divide-by-zero if rays coincide
+    az_frac = np.clip(diff_lo / az_gap, 0, 1)
 
-    out[inrange] = data[ai, ri]
+    ai_lo = sort_idx[pos_lo]
+    ai_hi = sort_idx[pos_hi]
+
+    # ── Bilinear blend of the four corner values ──
+    v_lo_lo = data[ai_lo, ri_lo]
+    v_lo_hi = data[ai_lo, ri_hi]
+    v_hi_lo = data[ai_hi, ri_lo]
+    v_hi_hi = data[ai_hi, ri_hi]
+
+    # NaN-aware blending: if any corner is NaN (no data at that gate),
+    # fall back toward whichever corners DO have data rather than letting
+    # one missing corner poison the whole interpolated value to NaN.
+    def _blend_range(v_lo, v_hi, frac):
+        both_nan = np.isnan(v_lo) & np.isnan(v_hi)
+        only_lo  = np.isnan(v_hi) & ~np.isnan(v_lo)
+        only_hi  = np.isnan(v_lo) & ~np.isnan(v_hi)
+        blended  = v_lo + (v_hi - v_lo) * frac
+        blended  = np.where(only_lo, v_lo, blended)
+        blended  = np.where(only_hi, v_hi, blended)
+        blended  = np.where(both_nan, np.nan, blended)
+        return blended
+
+    v_lo = _blend_range(v_lo_lo, v_lo_hi, range_frac)
+    v_hi = _blend_range(v_hi_lo, v_hi_hi, range_frac)
+    v_final = _blend_range(v_lo, v_hi, az_frac)
+
+    out[inrange] = v_final
     return out
 
 
