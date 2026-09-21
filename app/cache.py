@@ -15,7 +15,9 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Decoded source datasets: small count, short TTL (radar updates ~4-6 min,
 # RTMA hourly, RRFS hourly). Keep a few minutes.
-_source_cache = TTLCache(maxsize=24, ttl=300)
+# 8 slots instead of 24 — with 1 gunicorn worker this is plenty, and each
+# slot holds a full decoded dataset, so keeping it small directly caps RAM.
+_source_cache = TTLCache(maxsize=8, ttl=300)
 _source_lock = threading.Lock()
 
 
