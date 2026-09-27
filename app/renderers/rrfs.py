@@ -23,7 +23,9 @@ from botocore import UNSIGNED
 from botocore.client import Config
 
 from ..tileutil import tile_latlon_grid, apply_colormap, rgba_to_png, empty_tile_png
-from ..cache import get_source
+import os
+
+from ..cache import get_source, release_memory
 
 RRFS_BUCKET = "noaa-rrfs-pds"
 _s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED), region_name="us-east-1")
@@ -64,39 +66,99 @@ def _key_for_fhour(prefix, cycle, fhour):
     return f"{prefix}rrfs.t{cycle.hour:02d}z.prslev.3km.f{fhour:03d}.conus.grib2"
 
 
+# The prslev file carries every pressure-level field (hundreds of MB). NOAA
+# publishes a .idx sidecar listing each GRIB message's byte offset, so we
+# fetch ONLY the reflectivity message with an HTTP Range request (a few MB).
+# Falls back to the full download if the .idx is missing or unrecognized.
+_REFL_NAMES = ("REFC", "MAXREF")
+
+
+def _idx_byte_range(key):
+    """Return (start, end_or_None) of the reflectivity message, or None."""
+    try:
+        body = _s3.get_object(Bucket=RRFS_BUCKET, Key=key + ".idx")["Body"].read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    return parse_idx_range(body, _REFL_NAMES)
+
+
+def parse_idx_range(idx_text, names):
+    """Parse NOAA wgrib2-style .idx lines: 'num:offset:d=YYYYMMDDHH:VAR:level:fcst:'."""
+    lines = [l for l in idx_text.splitlines() if l.count(":") >= 4]
+    for want in names:
+        for i, line in enumerate(lines):
+            parts = line.split(":")
+            if parts[3] == want:
+                start = int(parts[1])
+                end = int(lines[i + 1].split(":")[1]) - 1 if i + 1 < len(lines) else None
+                return start, end
+    return None
+
+
+# Lat/lon arrays are identical for every forecast hour — keep one shared copy
+# instead of a duplicate pair per cached hour.
+_coords = {}
+
+
+def _shared_coords(lats, lons):
+    k = lats.shape
+    if k not in _coords:
+        _coords.clear()
+        _coords[k] = (lats, lons)
+    return _coords[k]
+
+
 def _load_fhour(fhour):
     import xarray as xr
     cycle, prefix = _latest_cycle()
     if not prefix:
         raise FileNotFoundError("No RRFS cycle available")
     key = _key_for_fhour(prefix, cycle, fhour)
+
+    rng = _idx_byte_range(key)
     with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as tf:
-        _s3.download_fileobj(RRFS_BUCKET, key, tf)
         path = tf.name
+        if rng:
+            start, end = rng
+            byte_range = f"bytes={start}-{end}" if end is not None else f"bytes={start}-"
+            body = _s3.get_object(Bucket=RRFS_BUCKET, Key=key, Range=byte_range)["Body"]
+            for chunk in iter(lambda: body.read(1 << 20), b""):
+                tf.write(chunk)
+        else:
+            _s3.download_fileobj(RRFS_BUCKET, key, tf)
 
     ds = None
-    for filt in (
-        {"shortName": "refc"},
-        {"shortName": "maxref"},
-        {"parameterName": "Maximum/Composite radar reflectivity"},
-    ):
-        try:
-            ds = xr.open_dataset(path, engine="cfgrib",
-                                 backend_kwargs={"filter_by_keys": filt, "indexpath": ""})
-            break
-        except Exception:
-            continue
-    if ds is None:
-        raise KeyError("No reflectivity field in RRFS file")
+    try:
+        for filt in (
+            {"shortName": "refc"},
+            {"shortName": "maxref"},
+            {"parameterName": "Maximum/Composite radar reflectivity"},
+        ):
+            try:
+                ds = xr.open_dataset(path, engine="cfgrib",
+                                     backend_kwargs={"filter_by_keys": filt, "indexpath": ""})
+                break
+            except Exception:
+                continue
+        if ds is None:
+            raise KeyError("No reflectivity field in RRFS file")
 
-    var = list(ds.data_vars)[0]
-    dbz = ds[var].values
-    lats = ds["latitude"].values
-    lons = ds["longitude"].values
-    if lons.max() > 180:
-        lons = np.where(lons > 180, lons - 360, lons)
-    return {"dbz": dbz.astype("float32"), "lats": lats.astype("float32"),
-            "lons": lons.astype("float32")}
+        var = list(ds.data_vars)[0]
+        dbz = ds[var].values.astype("float32")
+        lats = ds["latitude"].values.astype("float32")
+        lons = ds["longitude"].values
+        if lons.max() > 180:
+            lons = np.where(lons > 180, lons - 360, lons)
+        lats, lons = _shared_coords(lats, lons.astype("float32"))
+        return {"dbz": dbz, "lats": lats, "lons": lons}
+    finally:
+        if ds is not None:
+            ds.close()
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        release_memory()
 
 
 def _sample_to_tile(grid, lat2d, lon2d):

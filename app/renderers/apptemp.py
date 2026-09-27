@@ -20,7 +20,9 @@ from botocore import UNSIGNED
 from botocore.client import Config
 
 from ..tileutil import tile_latlon_grid, apply_colormap, rgba_to_png, empty_tile_png
-from ..cache import get_source
+import os
+
+from ..cache import get_source, release_memory
 
 RTMA_BUCKET = "noaa-rtma-pds"
 _s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED), region_name="us-east-1")
@@ -90,9 +92,32 @@ def _load_rtma():
         _s3.download_fileobj(RTMA_BUCKET, key, tf)
         path = tf.name
 
+    opened = []
+
     def read(var, **filt):
-        return xr.open_dataset(path, engine="cfgrib",
-                               backend_kwargs={"filter_by_keys": filt, "indexpath": ""})
+        ds = xr.open_dataset(path, engine="cfgrib",
+                             backend_kwargs={"filter_by_keys": filt, "indexpath": ""})
+        opened.append(ds)
+        return ds
+
+    try:
+        return _compute_apptemp(read)
+    finally:
+        # Old code never closed these datasets or deleted the downloaded GRIB,
+        # so every hourly refresh leaked a file into /tmp.
+        for ds in opened:
+            try:
+                ds.close()
+            except Exception:
+                pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        release_memory()
+
+
+def _compute_apptemp(read):
 
     # 2m temperature & dewpoint
     ds_t = read("t2m", typeOfLevel="heightAboveGround", level=2)
