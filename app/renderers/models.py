@@ -249,6 +249,7 @@ def _decode(path, filters):
         vals = da.values.astype("float32")
         lats, lons = ds["latitude"].values, ds["longitude"].values
         grid = _grid_from_dataset(da, lats, lons)
+        grid["units"] = str(da.attrs.get("units", da.attrs.get("GRIB_units", "")))
         return vals, grid
     finally:
         if ds is not None:
@@ -457,8 +458,19 @@ def _load_ecmwf_family(model, cycle, fhour):
         return {"vals": _pack(np.clip(vals * 3600.0, 0, None)), "grid": grid}
     step = _ECMWF_STEP[model]
     tp1, grid = _ecmwf_tp(cycle, fhour, model)
+    # IFS publishes tp in metres; AIFS publishes it in kg m-2 (= mm). Scale by
+    # the file's own units instead of assuming — assuming metres made AIFS
+    # rates 1000x too large.
+    scale = 1000.0 if grid.get("units", "").strip().lower() in ("m", "metre", "metres", "meter", "meters") else 1.0
     tp0, _ = _ecmwf_tp(cycle, fhour - step, model)
-    rate = np.clip((tp1 - tp0) * 1000.0 / step, 0, None)   # metres over the step -> mm/hr
+    diff = tp1 - tp0
+    finite = np.isfinite(diff)
+    if finite.any() and float(np.mean(diff[finite] < -1e-6 * (1.0 if scale == 1.0 else 0.001))) > 0.05:
+        # Not accumulated since the start of the run (values go DOWN between
+        # steps), so each file already holds just its own interval's total.
+        rate = np.clip(tp1 * scale / step, 0, None)
+    else:
+        rate = np.clip(diff * scale / step, 0, None)
     return {"vals": _pack(rate), "grid": grid}
 
 
