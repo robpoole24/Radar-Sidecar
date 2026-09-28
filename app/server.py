@@ -118,7 +118,6 @@ def meta_debug_list():
                         "files": [c["Key"] for c in r.get("Contents", [])]})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
-<<<<<<< HEAD
 
 
 # Step-by-step diagnosis of one model frame: which run and file it picked, what
@@ -162,8 +161,6 @@ def meta_debug_load():
         out["error"] = f"{type(e).__name__}: {e}"
         out["trace"] = traceback.format_exc().splitlines()[-12:]
     return jsonify(out)
-=======
->>>>>>> ffc1a9c4b2f1c41d6f8695257199386b06170b49
 
 
 @app.errorhandler(500)
