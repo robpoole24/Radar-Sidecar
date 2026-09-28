@@ -58,6 +58,8 @@ MODELS = {
               "min_fhours": 13},
     "gfs":   {"label": "GFS", "kind": "reflectivity", "fhours": list(range(0, 49, 3))},
     "ecmwf": {"label": "ECMWF IFS", "kind": "precip", "fhours": list(range(3, 49, 3))},
+    # ECMWF's AI model. Open data is 6-hourly, so frames are 6 h apart.
+    "aifs":  {"label": "ECMWF AIFS", "kind": "precip", "fhours": list(range(6, 49, 6))},
 }
 
 _meta_cache = TTLCache(maxsize=16, ttl=300)
@@ -409,47 +411,75 @@ def _load_gfs(cycle, fhour):
     return {"vals": _pack(vals), "grid": grid}
 
 
-# ── ECMWF IFS open data (precipitation rate from accumulated tp) ────────────
+# ── ECMWF open data: IFS (physics) and AIFS (AI) — same bucket, same format ──
 ECMWF_BUCKET = "ecmwf-forecasts"
+# Folder per model inside YYYYMMDD/HHz/. AIFS has been published under more
+# than one folder name, so candidates are tried and the working one remembered.
+_ECMWF_DIRS = {"ecmwf": ["ifs/0p25/oper"], "aifs": ["aifs-single/0p25/oper", "aifs/0p25/oper"]}
+_ECMWF_STEP = {"ecmwf": 3, "aifs": 6}
+_ecmwf_dir_ok = {}
 
 
-def _ecmwf_key(cycle, step):
+def _ecmwf_key(cycle, step, model="ecmwf", folder=None):
     d, h = cycle[:8], cycle[8:]
-    return f"{d}/{h}z/ifs/0p25/oper/{d}{h}0000-{step}h-oper-fc.grib2"
+    folder = folder or _ecmwf_dir_ok.get(model) or _ECMWF_DIRS[model][0]
+    return f"{d}/{h}z/{folder}/{d}{h}0000-{step}h-oper-fc.grib2"
 
 
-def _ecmwf_tp(cycle, step):
-    key = _ecmwf_key(cycle, step)
-    index = _s3.get_object(Bucket=ECMWF_BUCKET, Key=key[:-len(".grib2")] + ".index")["Body"].read().decode()
+def _ecmwf_index(model, cycle, step):
+    key = _ecmwf_key(cycle, step, model)
+    return key, _s3.get_object(Bucket=ECMWF_BUCKET, Key=key[:-len(".grib2")] + ".index")["Body"].read().decode()
+
+
+def _ecmwf_tp(cycle, step, model="ecmwf"):
+    key, index = _ecmwf_index(model, cycle, step)
     rng = parse_ecmwf_index(index, "tp")
     if not rng:
-        raise KeyError("tp not in ECMWF index")
+        raise KeyError(f"tp not in {model} index")
     return _decode(_download_range(ECMWF_BUCKET, key, rng), [{"shortName": "tp"}, {}])
 
 
-def _ecmwf_latest():
-    last = MODELS["ecmwf"]["fhours"][-1]
-    for c in _recent_cycles(12, back_h=48):
-        if _exists(ECMWF_BUCKET, _ecmwf_key(c, last)[:-len(".grib2")] + ".index"):
-            return c, MODELS["ecmwf"]["fhours"]
+def _ecmwf_latest_for(model):
+    last = MODELS[model]["fhours"][-1]
+    for c in _recent_cycles(6 if model == "aifs" else 12, back_h=48):
+        for folder in ([_ecmwf_dir_ok[model]] if model in _ecmwf_dir_ok else _ECMWF_DIRS[model]):
+            if _exists(ECMWF_BUCKET, _ecmwf_key(c, last, model, folder)[:-len(".grib2")] + ".index"):
+                _ecmwf_dir_ok[model] = folder
+                return c, MODELS[model]["fhours"]
     return None, []
 
 
-def _load_ecmwf(cycle, fhour):
-    key = _ecmwf_key(cycle, fhour)
-    index = _s3.get_object(Bucket=ECMWF_BUCKET, Key=key[:-len(".grib2")] + ".index")["Body"].read().decode()
+def _load_ecmwf_family(model, cycle, fhour):
+    key, index = _ecmwf_index(model, cycle, fhour)
     rng = parse_ecmwf_index(index, "tprate")
     if rng:   # kg m-2 s-1 == mm/s  ->  mm/hr
         vals, grid = _decode(_download_range(ECMWF_BUCKET, key, rng), [{"shortName": "tprate"}, {}])
         return {"vals": _pack(np.clip(vals * 3600.0, 0, None)), "grid": grid}
-    tp1, grid = _ecmwf_tp(cycle, fhour)
-    tp0, _ = _ecmwf_tp(cycle, fhour - 3)
-    rate = np.clip((tp1 - tp0) * 1000.0 / 3.0, 0, None)   # metres over 3h -> mm/hr
+    step = _ECMWF_STEP[model]
+    tp1, grid = _ecmwf_tp(cycle, fhour, model)
+    tp0, _ = _ecmwf_tp(cycle, fhour - step, model)
+    rate = np.clip((tp1 - tp0) * 1000.0 / step, 0, None)   # metres over the step -> mm/hr
     return {"vals": _pack(rate), "grid": grid}
 
 
-_LATEST = {"rrfs": _rrfs_latest, "gfs": _gfs_latest, "ecmwf": _ecmwf_latest}
-_LOAD = {"rrfs": _load_rrfs, "gfs": _load_gfs, "ecmwf": _load_ecmwf}
+def _ecmwf_latest():
+    return _ecmwf_latest_for("ecmwf")
+
+
+def _aifs_latest():
+    return _ecmwf_latest_for("aifs")
+
+
+def _load_ecmwf(cycle, fhour):
+    return _load_ecmwf_family("ecmwf", cycle, fhour)
+
+
+def _load_aifs(cycle, fhour):
+    return _load_ecmwf_family("aifs", cycle, fhour)
+
+
+_LATEST = {"rrfs": _rrfs_latest, "gfs": _gfs_latest, "ecmwf": _ecmwf_latest, "aifs": _aifs_latest}
+_LOAD = {"rrfs": _load_rrfs, "gfs": _load_gfs, "ecmwf": _load_ecmwf, "aifs": _load_aifs}
 
 
 # ── Public API ───────────────────────────────────────────────────────────────

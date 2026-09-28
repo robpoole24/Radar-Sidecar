@@ -99,6 +99,23 @@ def meta_rrfs():
     return _meta_response(model_renderer.meta("rrfs"))
 
 
+# ── Diagnostics lock ─────────────────────────────────────────────────────────
+# /meta/debug/* can make the service download data on demand, so it's off
+# unless DEBUG_KEY is set, and then needs ?key=<DEBUG_KEY>. Anyone else gets a
+# plain 404, as if the routes didn't exist.
+import hmac as _hmac
+_DEBUG_KEY = os.environ.get("DEBUG_KEY", "")
+
+
+@app.before_request
+def _guard_debug():
+    from flask import request, abort
+    if request.path.startswith("/meta/debug"):
+        supplied = request.args.get("key", "")
+        if not _DEBUG_KEY or not _hmac.compare_digest(supplied.encode(), _DEBUG_KEY.encode()):
+            abort(404)
+
+
 # Read-only listing of the public NOAA/ECMWF buckets this service reads, so new
 # products (e.g. REFS) can be located from the live deploy. Limited output.
 _DEBUG_BUCKETS = {"noaa-rrfs-ops-pds", "noaa-gfs-bdp-pds", "ecmwf-forecasts"}
@@ -148,9 +165,8 @@ def meta_debug_load():
             out["products"] = {prod: len(keys) for prod, keys in listing.items()}
             out["chosen"] = dict(m._rrfs_choice)
             out["range"] = m.parse_idx_range(idx, (m._rrfs_choice["field"],) if m._rrfs_choice["field"] else m._REFL_FIELDS)
-        elif model == "ecmwf":
-            key = m._ecmwf_key(cycle, fh); out["key"] = key
-            index = m._s3.get_object(Bucket=m.ECMWF_BUCKET, Key=key[:-len(".grib2")] + ".index")["Body"].read().decode()
+        elif model in ("ecmwf", "aifs"):
+            key, index = m._ecmwf_index(model, cycle, fh); out["key"] = key
             out["indexParams"] = sorted({__import__("json").loads(l).get("param") for l in index.splitlines() if l.strip()})[:60]
             out["range"] = m.parse_ecmwf_index(index, "tp")
         data = m._LOAD[model](cycle, fh)
