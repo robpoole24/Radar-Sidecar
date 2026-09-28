@@ -21,6 +21,7 @@ from .cache import get_tile, put_tile, current_epoch
 from .renderers import cc as cc_renderer
 from .renderers import apptemp as apptemp_renderer
 from .renderers import models as model_renderer
+from .renderers import meso as meso_renderer
 from .tileutil import empty_tile_png
 
 app = Flask(__name__)
@@ -89,6 +90,26 @@ def _meta_response(payload):
     return resp
 
 
+@app.route("/tiles/meso/<param>/<cycle>/<int:z>/<int:x>/<int:y>.png")
+def tile_meso(param, cycle, z, x, y):
+    if z > MAX_ZOOM or not meso_renderer.valid_request(param, cycle):
+        return _png_response(empty_tile_png(), cache_seconds=60)
+    key = f"meso::{param}::{cycle}::{z}::{x}::{y}"
+    cached = get_tile(key, max_age=24 * 3600)
+    if cached:
+        return _png_response(cached, cache_seconds=86400)
+    png, ok = meso_renderer.render_tile(param, cycle, z, x, y)
+    if not ok:
+        return _png_response(png, cache_seconds=60)
+    put_tile(key, png)
+    return _png_response(png, cache_seconds=86400)
+
+
+@app.route("/meta/meso")
+def meta_meso():
+    return _meta_response(meso_renderer.meta())
+
+
 @app.route("/meta/models")
 def meta_models():
     return _meta_response({"models": {m: model_renderer.meta(m) for m in model_renderer.MODELS}})
@@ -144,6 +165,22 @@ def meta_debug_load():
     from flask import request
     import traceback
     model = request.args.get("model", "rrfs")
+    if model == "meso":   # ?model=meso&param=stp
+        param = request.args.get("param", "mlcape")
+        out = {"model": "meso", "param": param, "meta": meso_renderer.meta()}
+        try:
+            c = meso_renderer.latest_cycle(); out["cycle"] = c
+            key = meso_renderer._key(c); out["key"] = key
+            idx = model_renderer._s3.get_object(Bucket=meso_renderer.HRRR_BUCKET, Key=key + ".idx")["Body"].read().decode("utf-8", "replace")
+            out["fieldsFound"] = {n: bool(meso_renderer._field_range(idx, *vl)) for n, vl in meso_renderer.FIELDS.items()}
+            import numpy as np
+            v = meso_renderer._param_field(c, param)["vals"].astype("float32")
+            out["values"] = {"min": float(np.nanmin(v)), "max": float(np.nanmax(v)), "nanPct": round(float(np.isnan(v).mean()) * 100, 1)}
+            out["ok"] = True
+        except Exception as e:
+            import traceback
+            out["error"] = f"{type(e).__name__}: {e}"; out["trace"] = traceback.format_exc().splitlines()[-8:]
+        return jsonify(out)
     if model not in model_renderer.MODELS:
         return jsonify({"error": "unknown model"}), 400
     out = {"model": model}
