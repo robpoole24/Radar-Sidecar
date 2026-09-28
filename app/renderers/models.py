@@ -265,7 +265,13 @@ def _pack(vals):
 # ── RRFS (operational bucket, layout discovered) ────────────────────────────
 RRFS_BUCKET = "noaa-rrfs-ops-pds"
 _RRFS_DAY = re.compile(r"(?:^|/)rrfs\.(\d{8})/$")
-_RRFS_FILE = re.compile(r"rrfs\.t(\d{2})z\.prslev\.(?:[0-9p]+km\.)?f(\d{3})\.conus\.grib2$")
+# Any CONUS deterministic product: rrfs.tHHz.<product>[.3km].fFFF.conus.grib2
+_RRFS_FILE = re.compile(r"rrfs\.t(\d{2})z\.([a-z0-9]+)\.(?:[0-9p]+km\.)?f(\d{3})\.conus\.grib2$")
+# Reflectivity isn't in every product file (the operational prslev file has no
+# REFC), so the product that carries it is found automatically and remembered.
+_REFL_FIELDS = ("REFC", "MAXREF", "REFD")
+_rrfs_choice = {"product": None, "field": None, "ts": 0}
+_PRODUCT_PREF = ("2dfld", "prslev", "natlev", "subh")
 
 
 def _rrfs_base_prefix():
@@ -284,15 +290,50 @@ def _rrfs_base_prefix():
     raise FileNotFoundError("RRFS folders not found in noaa-rrfs-ops-pds")
 
 
+def _rrfs_listing(cycle):
+    """{product: {fhour: key}} for one cycle's CONUS deterministic files."""
+    base = _rrfs_base_prefix()
+    out = {}
+    for k in _list_keys(RRFS_BUCKET, f"{base}rrfs.{cycle[:8]}/{cycle[8:]}/"):
+        if "/ens" in k or "mem" in k:
+            continue
+        m = _RRFS_FILE.search(k)
+        if m and m.group(1) == cycle[8:]:
+            out.setdefault(m.group(2), {}).setdefault(int(m.group(3)), k)
+    return out
+
+
+def _find_refl_field(idx_text):
+    have = {l.split(":")[3] for l in idx_text.splitlines() if l.count(":") >= 4}
+    return next((f for f in _REFL_FIELDS if f in have), None)
+
+
+def _rrfs_pick_product(listing):
+    """Which product file carries reflectivity (checked once, cached 6 h)."""
+    if _rrfs_choice["product"] in listing and time.time() - _rrfs_choice["ts"] < 6 * 3600:
+        return _rrfs_choice["product"], _rrfs_choice["field"]
+    order = sorted(listing, key=lambda p: (_PRODUCT_PREF.index(p) if p in _PRODUCT_PREF else 99, p))
+    for prod in order:
+        keys = listing[prod]
+        sample = keys.get(1) or keys[min(keys)]
+        try:
+            idx = _s3.get_object(Bucket=RRFS_BUCKET, Key=sample + ".idx")["Body"].read().decode("utf-8", "replace")
+        except Exception:
+            continue
+        field = _find_refl_field(idx)
+        if field:
+            _rrfs_choice.update(product=prod, field=field, ts=time.time())
+            print(f"[models] RRFS reflectivity found in '{prod}' files as {field}", flush=True)
+            return prod, field
+    return None, None
+
+
 def _rrfs_cycle_keys(cycle):
     if cycle in _rrfs_keys_cache:
         return _rrfs_keys_cache[cycle]
-    base = _rrfs_base_prefix()
-    keys = {}
-    for k in _list_keys(RRFS_BUCKET, f"{base}rrfs.{cycle[:8]}/{cycle[8:]}/"):
-        m = _RRFS_FILE.search(k)
-        if m and m.group(1) == cycle[8:] and "/ens" not in k and "mem" not in k:
-            keys.setdefault(int(m.group(2)), k)
+    listing = _rrfs_listing(cycle)
+    prod, _ = _rrfs_pick_product(listing) if listing else (None, None)
+    keys = listing.get(prod, {}) if prod else {}
     _rrfs_keys_cache[cycle] = keys
     return keys
 
@@ -324,10 +365,11 @@ def _load_rrfs(cycle, fhour):
     if not key:
         raise FileNotFoundError(f"RRFS {cycle} f{fhour:03d} not published")
     idx = _s3.get_object(Bucket=RRFS_BUCKET, Key=key + ".idx")["Body"].read().decode("utf-8", "replace")
-    rng = parse_idx_range(idx, ("REFC",))
+    field = _rrfs_choice["field"] or _find_refl_field(idx)
+    rng = parse_idx_range(idx, (field,) if field else _REFL_FIELDS)
     if not rng:
-        raise KeyError("REFC not in RRFS index")
-    vals, grid = _decode(_download_range(RRFS_BUCKET, key, rng), [{"shortName": "refc"}, {}])
+        raise KeyError("no reflectivity field in RRFS index")
+    vals, grid = _decode(_download_range(RRFS_BUCKET, key, rng), [{"shortName": (field or "refc").lower()}, {}])
     return {"vals": _pack(vals), "grid": grid}
 
 
@@ -394,6 +436,12 @@ def _ecmwf_latest():
 
 
 def _load_ecmwf(cycle, fhour):
+    key = _ecmwf_key(cycle, fhour)
+    index = _s3.get_object(Bucket=ECMWF_BUCKET, Key=key[:-len(".grib2")] + ".index")["Body"].read().decode()
+    rng = parse_ecmwf_index(index, "tprate")
+    if rng:   # kg m-2 s-1 == mm/s  ->  mm/hr
+        vals, grid = _decode(_download_range(ECMWF_BUCKET, key, rng), [{"shortName": "tprate"}, {}])
+        return {"vals": _pack(np.clip(vals * 3600.0, 0, None)), "grid": grid}
     tp1, grid = _ecmwf_tp(cycle, fhour)
     tp0, _ = _ecmwf_tp(cycle, fhour - 3)
     rate = np.clip((tp1 - tp0) * 1000.0 / 3.0, 0, None)   # metres over 3h -> mm/hr

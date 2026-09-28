@@ -144,7 +144,10 @@ def meta_debug_load():
             idx = m._s3.get_object(Bucket=m.RRFS_BUCKET, Key=key + ".idx")["Body"].read().decode("utf-8", "replace")
             out["idxMatches"] = [l for l in idx.splitlines() if any(t in l for t in ("REFC", "REFD", "MAXREF"))][:8]
             out["idxLines"] = len(idx.splitlines())
-            out["range"] = m.parse_idx_range(idx, ("REFC",))
+            listing = m._rrfs_listing(cycle)
+            out["products"] = {prod: len(keys) for prod, keys in listing.items()}
+            out["chosen"] = dict(m._rrfs_choice)
+            out["range"] = m.parse_idx_range(idx, (m._rrfs_choice["field"],) if m._rrfs_choice["field"] else m._REFL_FIELDS)
         elif model == "ecmwf":
             key = m._ecmwf_key(cycle, fh); out["key"] = key
             index = m._s3.get_object(Bucket=m.ECMWF_BUCKET, Key=key[:-len(".grib2")] + ".index")["Body"].read().decode()
