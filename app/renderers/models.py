@@ -47,6 +47,11 @@ DBZ_STOPS = [
     (65, (248, 0, 253)), (70, (152, 84, 198)),
 ]
 # Precipitation rate, mm/hr (≈ 0.004 in/hr … 3 in/hr)
+# Probability (%) — REFS "chance of strong storms"
+PROB_STOPS = [
+    (10, (120, 200, 120)), (20, (60, 170, 60)), (30, (240, 230, 60)), (40, (250, 190, 40)),
+    (50, (250, 140, 30)), (60, (240, 80, 30)), (70, (220, 30, 30)), (80, (200, 30, 140)), (90, (150, 40, 200)),
+]
 PRATE_STOPS = [
     (0.1, (4, 233, 231)), (0.5, (1, 159, 244)), (1.0, (2, 253, 2)), (2.5, (0, 142, 0)),
     (5.0, (253, 248, 2)), (10.0, (253, 149, 0)), (20.0, (253, 0, 0)), (40.0, (188, 0, 0)),
@@ -60,6 +65,9 @@ MODELS = {
     "ecmwf": {"label": "ECMWF IFS", "kind": "precip", "fhours": list(range(3, 49, 3))},
     # ECMWF's AI model. Open data is 6-hourly, so frames are 6 h apart.
     "aifs":  {"label": "ECMWF AIFS", "kind": "precip", "fhours": list(range(6, 49, 6))},
+    # REFS — NOAA's RRFS ensemble (replaces HREF). Products start at hour 1.
+    "refs":     {"label": "REFS most likely radar", "kind": "reflectivity", "fhours": list(range(1, 49))},
+    "refsprob": {"label": "REFS chance of strong storms", "kind": "prob", "fhours": list(range(1, 49))},
 }
 
 _meta_cache = TTLCache(maxsize=16, ttl=300)
@@ -490,8 +498,98 @@ def _load_aifs(cycle, fhour):
     return _load_ecmwf_family("aifs", cycle, fhour)
 
 
-_LATEST = {"rrfs": _rrfs_latest, "gfs": _gfs_latest, "ecmwf": _ecmwf_latest, "aifs": _aifs_latest}
-_LOAD = {"rrfs": _load_rrfs, "gfs": _load_gfs, "ecmwf": _load_ecmwf, "aifs": _load_aifs}
+
+# ── REFS (RRFS ensemble products) ────────────────────────────────────────────
+# Layout per NWS SCN 26-48: refs.YYYYMMDD/CC/ensprod/refs.tCCz.{type}.fFF.{dom}.grib2
+#   types: mean, sprd, pmmn (probability-matched mean), lpmm, eas (+ prob)
+# In noaa-rrfs-ops-pds alongside RRFS. Forecast hours start at 1 (no f00).
+_REFS_DAY = re.compile(r"refs\.\d{8}/$")
+_refs_base = {"prefix": None, "ts": 0}
+_refs_prob = {"type": None, "ts": 0}
+
+
+def _refs_base_prefix():
+    """Find where refs.YYYYMMDD/ folders live (bucket root, refs/, refs/v1.0/, …)."""
+    if _refs_base["prefix"] is not None and time.time() - _refs_base["ts"] < 6 * 3600:
+        return _refs_base["prefix"]
+    frontier, seen = [""], 0
+    while frontier and seen < 30:
+        pfx = frontier.pop(0); seen += 1
+        subs = _list_prefixes(RRFS_BUCKET, pfx)
+        if any(_REFS_DAY.search(x) for x in subs):
+            _refs_base.update(prefix=pfx, ts=time.time())
+            return pfx
+        frontier += [x for x in subs if "refs" in x.lower() and not _REFS_DAY.search(x) and x.count("/") <= 3]
+    raise FileNotFoundError("REFS folders not found in noaa-rrfs-ops-pds")
+
+
+def _refs_key(cycle, ptype, fhour):
+    d, h = cycle[:8], cycle[8:]
+    return f"{_refs_base_prefix()}refs.{d}/{h}/ensprod/refs.t{h}z.{ptype}.f{fhour:02d}.conus.grib2"
+
+
+def _refs_latest():
+    for c in _recent_cycles(1, back_h=30):
+        if _exists(RRFS_BUCKET, _refs_key(c, "pmmn", 18) + ".idx"):
+            return c, MODELS["refs"]["fhours"]
+    return None, []
+
+
+def _load_refs(cycle, fhour):
+    key = _refs_key(cycle, "pmmn", fhour)
+    idx = _s3.get_object(Bucket=RRFS_BUCKET, Key=key + ".idx")["Body"].read().decode("utf-8", "replace")
+    field = _find_refl_field(idx)
+    rng = parse_idx_range(idx, (field,) if field else _REFL_FIELDS)
+    if not rng:
+        raise KeyError("no reflectivity field in REFS pmmn index")
+    vals, grid = _decode(_download_range(RRFS_BUCKET, key, rng), [{"shortName": (field or "refc").lower()}, {}])
+    return {"vals": _pack(vals), "grid": grid}
+
+
+_PROB40 = re.compile(r"prob\s*>=?\s*40(\.0+)?(?![\d.])", re.I)
+
+
+def _refs_prob_range(idx_text):
+    """Byte range of 'composite reflectivity ≥ 40 dBZ' probability, if present."""
+    lines = [l for l in idx_text.splitlines() if l.count(":") >= 5]
+    for i, line in enumerate(lines):
+        parts = line.split(":")
+        if parts[3] in ("REFC", "MAXREF", "REFD") and _PROB40.search(line):
+            end = int(lines[i + 1].split(":")[1]) - 1 if i + 1 < len(lines) else None
+            return int(parts[1]), end, parts[3]
+    return None
+
+
+def _load_refsprob(cycle, fhour):
+    types = [_refs_prob["type"]] if _refs_prob["type"] else ["prob", "eas"]
+    last_err = None
+    for ptype in types:
+        key = _refs_key(cycle, ptype, fhour)
+        try:
+            idx = _s3.get_object(Bucket=RRFS_BUCKET, Key=key + ".idx")["Body"].read().decode("utf-8", "replace")
+        except Exception as e:
+            last_err = e; continue
+        hit = _refs_prob_range(idx)
+        if not hit:
+            sample = [l for l in idx.splitlines() if "prob" in l.lower()][:5]
+            last_err = KeyError(f"no ≥40 dBZ probability in REFS {ptype}; prob lines look like: {sample}")
+            continue
+        start, end, var = hit
+        vals, grid = _decode(_download_range(RRFS_BUCKET, key, (start, end)), [{}])
+        vals = np.asarray(vals, dtype="float32")
+        if np.nanmax(vals) <= 1.0001:            # some files store 0–1 instead of percent
+            vals = vals * 100.0
+        if _refs_prob["type"] != ptype:
+            _refs_prob.update(type=ptype, ts=time.time())
+            print(f"[models] REFS storm probability found in '{ptype}' files ({var} ≥ 40 dBZ)", flush=True)
+        return {"vals": _pack(vals), "grid": grid}
+    raise last_err or FileNotFoundError("REFS probability not found")
+
+
+_LATEST = {"rrfs": _rrfs_latest, "gfs": _gfs_latest, "ecmwf": _ecmwf_latest, "aifs": _aifs_latest,
+           "refs": _refs_latest, "refsprob": _refs_latest}
+_LOAD = {"rrfs": _load_rrfs, "gfs": _load_gfs, "ecmwf": _load_ecmwf, "aifs": _load_aifs,
+         "refs": _load_refs, "refsprob": _load_refsprob}
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -532,6 +630,9 @@ def render_tile(model, cycle, fhour, z, x, y):
     if MODELS[model]["kind"] == "precip":
         vals = np.where(vals < PRATE_STOPS[0][0], np.nan, vals)
         rgba = apply_colormap(vals, PRATE_STOPS, alpha=180)
+    elif MODELS[model]["kind"] == "prob":
+        vals = np.where(vals < PROB_STOPS[0][0], np.nan, vals)
+        rgba = apply_colormap(vals, PROB_STOPS, alpha=170)
     else:
         vals = np.where(vals < 5, np.nan, vals)
         rgba = apply_colormap(vals, DBZ_STOPS, alpha=180)
