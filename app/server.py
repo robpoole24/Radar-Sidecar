@@ -212,6 +212,9 @@ def meta_debug_load():
         out["grid"] = {k: (v2 if isinstance(v2, (int, float, str, bool)) else str(type(v2).__name__)) for k, v2 in data["grid"].items() if k != "p"}
         out["values"] = {"shape": list(v.shape), "min": float(np.nanmin(v)), "max": float(np.nanmax(v)),
                          "nanPct": round(float(np.isnan(v).mean()) * 100, 1)}
+        if data.get("fill"):
+            f = data["fill"]
+            out["fill"] = {"key": f["key"], "gridType": f["grid"]["type"], "shape": list(f["vals"].shape)}
         out["ok"] = True
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"

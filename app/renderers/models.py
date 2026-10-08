@@ -17,6 +17,10 @@ Sources (all public, no key):
   RRFS  noaa-rrfs-ops-pds   operational bucket; carries the pre-implementation
                             parallel feed now AND production after launch.
                             Layout is discovered by listing, not hard-coded.
+                            The hourly 3 km CONUS grid stops short of the Gulf,
+                            Caribbean and open Atlantic, so tiles outside it are
+                            filled from the 13 km North America grid of the
+                            newest 00/06/12/18Z run at the SAME valid time.
   GFS   noaa-gfs-bdp-pds    gfs.YYYYMMDD/HH/atmos/gfs.tHHz.pgrb2.0p25.fFFF
   ECMWF ecmwf-forecasts     YYYYMMDD/HHz/ifs/0p25/oper/...-{step}h-oper-fc.grib2
                             (ECMWF open data, CC-BY-4.0 — attribution shown in UI)
@@ -160,6 +164,53 @@ def lcc_params(latin1, latin2, lov):
     return {"n": float(n), "F": float(F), "lam0": float(np.radians(lov))}
 
 
+# Curvilinear grids (e.g. RRFS 13 km North America is a ROTATED lat/lon grid)
+# can't be indexed with the row/column shortcut, so they use a nearest-
+# neighbour search on the grid's own lat/lon points. The tree only depends on
+# the grid, so one tree is shared by every frame of every run on that grid.
+_kd_cache = {}
+_kd_lock = threading.Lock()
+
+
+def _unit_xyz(lat, lon):
+    la, lo = np.radians(np.asarray(lat, dtype="float64")), np.radians(np.asarray(lon, dtype="float64"))
+    return np.stack([np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)], axis=-1)
+
+
+def _kd_grid(lats, lons):
+    from scipy.spatial import cKDTree
+    sig = (lats.shape, round(float(lats[0, 0]), 4), round(float(lons[0, 0]), 4),
+           round(float(lats[-1, -1]), 4), round(float(lons[-1, -1]), 4))
+    with _kd_lock:
+        hit = _kd_cache.get(sig)
+    if hit is None:
+        xyz = _unit_xyz(lats, lons)
+        mid = xyz[lats.shape[0] // 2]
+        spacing = float(np.median(np.linalg.norm(np.diff(mid, axis=0), axis=1)))
+        hit = (cKDTree(xyz.reshape(-1, 3)), spacing)
+        with _kd_lock:
+            if len(_kd_cache) >= 3:
+                _kd_cache.pop(next(iter(_kd_cache)))
+            _kd_cache[sig] = hit
+        print(f"[models] built KD index for {lats.shape} grid (spacing {np.degrees(spacing):.3f} deg)", flush=True)
+    return {"type": "kd", "tree": hit[0], "spacing": hit[1], "ny": lats.shape[0], "nx": lats.shape[1]}
+
+
+def _sample_kd(vals, g, lat2d, lon2d):
+    """Inverse-distance blend of the 4 nearest grid points; NaN off the grid."""
+    pts = _unit_xyz(lat2d, lon2d).reshape(-1, 3)
+    d, idx = g["tree"].query(pts, k=4, distance_upper_bound=g["spacing"] * 1.5)
+    flat = vals.astype("float32", copy=False).ravel()
+    ok = idx < flat.size
+    v = np.where(ok, flat[np.where(ok, idx, 0)], np.nan)
+    w = np.where(ok & np.isfinite(v), 1.0 / np.maximum(d, 1e-12), 0.0)
+    den = w.sum(axis=1)
+    num = np.where(w > 0, v * w, 0.0).sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = np.where(den > 0, num / den, np.nan)
+    return out.reshape(lat2d.shape).astype("float32")
+
+
 def _grid_from_dataset(da, lats, lons):
     """Build a projection descriptor for fast tile sampling. Self-checks
     against the dataset's own lat/lon arrays and falls back if it disagrees."""
@@ -185,6 +236,9 @@ def _grid_from_dataset(da, lats, lons):
             print(f"[models] LCC self-check failed ({float(fi[0,0]):.1f},{float(fj[0,0]):.1f}); using fallback", flush=True)
         except Exception as e:
             print(f"[models] LCC params unavailable ({e}); using fallback", flush=True)
+    # Any other 2-D grid (rotated lat/lon, failed LCC check): exact point lookup
+    if lats.ndim == 2:
+        return _kd_grid(lats, lons)
     # Fallback for other grids: row/column lookup along the middle of the grid
     return {"type": "approx", "lat_col": lats[:, lats.shape[1] // 2].astype("float32"),
             "lon_row": lons[lons.shape[0] // 2, :].astype("float32"),
@@ -212,6 +266,8 @@ def _fractional_index(g, lat2d, lon2d):
 
 def sample_bilinear(vals, g, lat2d, lon2d):
     """Bilinear sample of a model grid onto tile pixels; NaN outside the grid."""
+    if g["type"] == "kd":
+        return _sample_kd(vals, g, lat2d, lon2d)
     fi, fj = _fractional_index(g, lat2d, lon2d)
     ny, nx = vals.shape
     wrap = g.get("wrap", False)
@@ -371,6 +427,49 @@ def _rrfs_latest():
     return best or (None, [])
 
 
+# ── RRFS North America fill (outside the CONUS grid) ─────────────────────────
+# Only the 00/06/12/18Z runs publish the North America domain (13 km, hourly to
+# 84 h). Each hourly CONUS frame is paired with the newest such run at the same
+# VALID time, so the fill always matches the frame's clock.
+_NA_MAX_FH = 84
+_na_exists = TTLCache(maxsize=512, ttl=600)
+
+
+def _rrfs_na_key(syn, fh):
+    d, h = syn.strftime("%Y%m%d"), syn.strftime("%H")
+    return f"{_rrfs_base_prefix()}rrfs.{d}/{h}/rrfs.t{h}z.2dfld.13km.f{fh:03d}.na.grib2"
+
+
+def _rrfs_fill_key(cycle, fhour):
+    t = dt.datetime.strptime(cycle, "%Y%m%d%H")
+    valid = t + dt.timedelta(hours=fhour)
+    syn = t - dt.timedelta(hours=t.hour % 6)
+    for _ in range(3):            # newest first; older runs if it isn't published yet
+        fh = int((valid - syn).total_seconds() // 3600)
+        if 0 <= fh <= _NA_MAX_FH:
+            key = _rrfs_na_key(syn, fh)
+            if key not in _na_exists:
+                _na_exists[key] = _exists(RRFS_BUCKET, key + ".idx")
+            if _na_exists[key]:
+                return key
+        syn -= dt.timedelta(hours=6)
+    return None
+
+
+def _load_rrfs_fill(cycle, fhour):
+    key = _rrfs_fill_key(cycle, fhour)
+    if not key:
+        return None
+    idx = _s3.get_object(Bucket=RRFS_BUCKET, Key=key + ".idx")["Body"].read().decode("utf-8", "replace")
+    field = _find_refl_field(idx)
+    rng = parse_idx_range(idx, (field,)) if field else None
+    if not rng:
+        return None
+    # The NA file leaves REFC's short name blank, so the unfiltered read ({}) is what decodes it
+    vals, grid = _decode(_download_range(RRFS_BUCKET, key, rng), [{"shortName": field.lower()}, {}])
+    return {"vals": _pack(vals), "grid": grid, "key": key}
+
+
 def _load_rrfs(cycle, fhour):
     key = _rrfs_cycle_keys(cycle).get(fhour)
     if not key:
@@ -381,7 +480,12 @@ def _load_rrfs(cycle, fhour):
     if not rng:
         raise KeyError("no reflectivity field in RRFS index")
     vals, grid = _decode(_download_range(RRFS_BUCKET, key, rng), [{"shortName": (field or "refc").lower()}, {}])
-    return {"vals": _pack(vals), "grid": grid}
+    fill = None
+    try:
+        fill = _load_rrfs_fill(cycle, fhour)
+    except Exception as e:          # the fill is a bonus — never lose the CONUS frame over it
+        print(f"[models] RRFS NA fill {cycle} f{fhour}: {type(e).__name__}: {e}", flush=True)
+    return {"vals": _pack(vals), "grid": grid, "fill": fill}
 
 
 # ── GFS ──────────────────────────────────────────────────────────────────────
@@ -627,6 +731,11 @@ def render_tile(model, cycle, fhour, z, x, y):
         return empty_tile_png(), False
     lat2d, lon2d = tile_latlon_grid(z, x, y)
     vals = sample_bilinear(data["vals"], data["grid"], lat2d, lon2d)
+    fill = data.get("fill")
+    if fill is not None:
+        gap = np.isnan(vals)                 # outside the primary (CONUS) grid
+        if gap.any():
+            vals = np.where(gap, sample_bilinear(fill["vals"], fill["grid"], lat2d, lon2d), vals)
     if MODELS[model]["kind"] == "precip":
         vals = np.where(vals < PRATE_STOPS[0][0], np.nan, vals)
         rgba = apply_colormap(vals, PRATE_STOPS, alpha=180)
