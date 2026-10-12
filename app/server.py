@@ -107,12 +107,22 @@ def tile_meso(param, cycle, z, x, y):
 
 @app.route("/meta/meso")
 def meta_meso():
-    return _meta_response(meso_renderer.meta())
+    # Always answer with JSON — an S3 hiccup here used to fall through to the
+    # 500 handler, which returns a PNG, and the radar couldn't read it.
+    try:
+        return _meta_response(meso_renderer.meta())
+    except Exception as e:
+        print(f"[meta/meso] {type(e).__name__}: {e}", flush=True)
+        return _meta_response({"available": False})
 
 
 @app.route("/meta/models")
 def meta_models():
-    return _meta_response({"models": {m: model_renderer.meta(m) for m in model_renderer.MODELS}})
+    try:
+        return _meta_response({"models": {m: model_renderer.meta(m) for m in model_renderer.MODELS}})
+    except Exception as e:
+        print(f"[meta/models] {type(e).__name__}: {e}", flush=True)
+        return _meta_response({"models": {}})
 
 
 @app.route("/meta/rrfs")
