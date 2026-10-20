@@ -23,6 +23,7 @@ from .renderers import apptemp as apptemp_renderer
 from .renderers import models as model_renderer
 from .renderers import meso as meso_renderer
 from .renderers import ptype as ptype_renderer
+from .renderers import foliage as foliage_renderer
 from .tileutil import empty_tile_png
 
 app = Flask(__name__)
@@ -134,6 +135,48 @@ def tile_ptype(scan, z, x, y):
     return _png_response(png, cache_seconds=1800)
 
 
+# Fall Colors — WeatherTV's own leaf-color model (NASA MODIS + NOAA). The version
+# in the URL changes once a day, so each tile caches well.
+@app.route("/tiles/foliage/<version>/<which>/<int:z>/<int:x>/<int:y>.png")
+def tile_foliage(version, which, z, x, y):
+    if z > MAX_ZOOM or which not in ("now", "week") or len(version) > 40:
+        return _png_response(empty_tile_png(), cache_seconds=60)
+    key = f"foliage::{version}::{which}::{z}::{x}::{y}"
+    cached = get_tile(key, max_age=24 * 3600)
+    if cached:
+        return _png_response(cached, cache_seconds=6 * 3600)
+    png, ok = foliage_renderer.render_tile(which, z, x, y)
+    if not ok:
+        return _png_response(png, cache_seconds=60)
+    put_tile(key, png)
+    return _png_response(png, cache_seconds=6 * 3600)
+
+
+@app.route("/meta/foliage")
+def meta_foliage():
+    try:
+        resp = _meta_response(foliage_renderer.meta())
+        resp.headers["Cache-Control"] = "public, max-age=120"
+        return resp
+    except Exception as e:
+        print(f"[meta/foliage] {type(e).__name__}: {e}", flush=True)
+        return _meta_response({"available": False})
+
+
+# One-time build of the leaf-color baseline (hours: NASA satellite years + NOAA
+# temperatures). Starts by itself when EARTHDATA_TOKEN is set and no baseline
+# exists; runs in its own process and picks up where it left off after a restart.
+def _auto_build():
+    try:
+        from .renderers import foliage_data
+        if os.environ.get("EARTHDATA_TOKEN") and foliage_data.start_build_process():
+            print("[foliage] baseline build started", flush=True)
+    except Exception as e:
+        print(f"[foliage] could not start build: {e}", flush=True)
+import threading as _th
+_th.Timer(45, _auto_build).start()
+
+
 @app.route("/meta/ptype")
 def meta_ptype():
     try:
@@ -197,6 +240,14 @@ def meta_debug_list():
 
 # Step-by-step diagnosis of one model frame: which run and file it picked, what
 # the byte-range index says, and the full error if decoding or drawing fails.
+@app.route("/meta/debug/foliage-build")
+def meta_debug_foliage_build():
+    from flask import request
+    from .renderers import foliage_data
+    started = foliage_data.start_build_process(force=request.args.get("force") == "1")
+    return jsonify({"started": started, "status": foliage_renderer.build_status()})
+
+
 @app.route("/meta/debug/load")
 def meta_debug_load():
     from flask import request
