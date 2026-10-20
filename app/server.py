@@ -22,6 +22,7 @@ from .renderers import cc as cc_renderer
 from .renderers import apptemp as apptemp_renderer
 from .renderers import models as model_renderer
 from .renderers import meso as meso_renderer
+from .renderers import ptype as ptype_renderer
 from .tileutil import empty_tile_png
 
 app = Flask(__name__)
@@ -113,6 +114,32 @@ def meta_meso():
         return _meta_response(meso_renderer.meta())
     except Exception as e:
         print(f"[meta/meso] {type(e).__name__}: {e}", flush=True)
+        return _meta_response({"available": False})
+
+
+# Winter radar (rain / snow / sleet / freezing rain). The scan stamp in the URL
+# comes from /meta/ptype, so each tile URL is one radar scan and caches well.
+@app.route("/tiles/ptype/<scan>/<int:z>/<int:x>/<int:y>.png")
+def tile_ptype(scan, z, x, y):
+    if z > MAX_ZOOM or len(scan) > 20 or not scan.replace("-", "").isdigit():
+        return _png_response(empty_tile_png(), cache_seconds=60)
+    key = f"ptype::{scan}::{z}::{x}::{y}"
+    cached = get_tile(key, max_age=1800)
+    if cached:
+        return _png_response(cached, cache_seconds=1800)
+    png, ok = ptype_renderer.render_tile(z, x, y)
+    if not ok:
+        return _png_response(png, cache_seconds=60)
+    put_tile(key, png)
+    return _png_response(png, cache_seconds=1800)
+
+
+@app.route("/meta/ptype")
+def meta_ptype():
+    try:
+        return _meta_response(ptype_renderer.latest_meta())
+    except Exception as e:
+        print(f"[meta/ptype] {type(e).__name__}: {e}", flush=True)
         return _meta_response({"available": False})
 
 
