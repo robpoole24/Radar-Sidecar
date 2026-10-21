@@ -515,44 +515,124 @@ def nbm_daily_means(dates):
 
 
 # ── This season ──────────────────────────────────────────────────────────────
+# ── This season ──────────────────────────────────────────────────────────────
+# Oct 2026: the weather-adjusted version tested worse than simply using each
+# place's usual dates (replay check: 23 days off vs 4), so stages now come from
+# the usual dates — satellite-observed, 2013–2023 — for EVERY US land cell
+# (cells without a forest signal take their neighbours' dates). The weather
+# adjustment comes back only once the replay check shows it beats the usual date.
+
+def _normals():
+    """Usual (median) Senescence / MidGreendown / Dormancy day-of-year per cell, any forest amount."""
+    path = _path("normals.npz")
+    if os.path.exists(path):
+        z = np.load(path); return {k: z[k] for k in z.files}
+    years = [int(f[5:9]) for f in os.listdir(F.data_dir()) if f.startswith("phen-") and f.endswith(".npz")]
+    st = {k: [] for k in ("sen", "mid", "dorm")}
+    for y in sorted(years):
+        z = np.load(_path(f"phen-{y}.npz"))
+        for k in st:
+            st[k].append(z[k].astype(np.float32))
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = {k: np.nanmedian(np.stack(v), axis=0).astype(np.float32) for k, v in st.items()}
+    np.savez_compressed(path, **out)
+    return out
+
+
+def _fill(grid2d, mask2d, iters=400):
+    """Fill NaN cells inside mask from their neighbours, outward (nearest-first)."""
+    g = np.where(mask2d, grid2d, np.nan).astype(np.float32)
+    for _ in range(iters):
+        missing = mask2d & ~np.isfinite(g)
+        if not missing.any():
+            break
+        acc = np.zeros_like(g); cnt = np.zeros_like(g)
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                sh = np.full_like(g, np.nan)
+                sh[max(dr, 0):g.shape[0] + min(dr, 0), max(dc, 0):g.shape[1] + min(dc, 0)] = \
+                    g[max(-dr, 0):g.shape[0] + min(-dr, 0), max(-dc, 0):g.shape[1] + min(-dc, 0)]
+                ok = np.isfinite(sh)
+                acc += np.where(ok, sh, 0); cnt += ok
+        newv = np.where(cnt > 0, acc / np.maximum(cnt, 1), np.nan)
+        g = np.where(missing & np.isfinite(newv), newv, g)
+    return g
+
+
+def _smooth(grid2d, mask2d):
+    """Light 3x3 average inside the mask (evens out pixel noise in the satellite dates)."""
+    g = grid2d.astype(np.float32); acc = np.zeros_like(g); cnt = np.zeros_like(g)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            sh = np.full_like(g, np.nan)
+            sh[max(dr, 0):g.shape[0] + min(dr, 0), max(dc, 0):g.shape[1] + min(dc, 0)] = \
+                g[max(-dr, 0):g.shape[0] + min(-dr, 0), max(-dc, 0):g.shape[1] + min(-dc, 0)]
+            ok = np.isfinite(sh) & mask2d
+            acc += np.where(ok, sh, 0); cnt += ok
+    return np.where(mask2d & (cnt > 0), acc / np.maximum(cnt, 1), np.nan).astype(np.float32)
+
+
+def us_land_mask(year):
+    """Cells NOAA nClimGrid has temperatures for = US land (no Canada, Mexico or water)."""
+    path = _path("usland.npy")
+    if os.path.exists(path):
+        return np.load(path)
+    for y in (year, year - 1):
+        for m in (9, 8, 7):
+            days = nclim_month(y, m)
+            if days:
+                fin = np.mean([np.isfinite(v) for v in days.values()], axis=0) > 0.5
+                np.save(path, fin)
+                return fin
+    raise RuntimeError("no nClimGrid month available for the land mask")
+
+
+def season_dates(today):
+    """Usual dates for every US land cell, filled + lightly smoothed, as flat arrays."""
+    land = us_land_mask(today.year).reshape(F.NROWS, F.NCOLS)
+    nm = _normals()
+    out = {}
+    for k in ("sen", "mid", "dorm"):
+        g = nm[k].reshape(F.NROWS, F.NCOLS)
+        g = _fill(np.where(land, g, np.nan), land)
+        out[k] = _smooth(g, land).ravel()
+    out["land"] = land.ravel()
+    return out
+
+
+def stage_from_dates(doy, sen, mid, dorm):
+    """0 Little · 1 Low · 2 Moderate · 3 High · 4 Peak · 5 Past peak, as a smooth value.
+
+    f = how far today is between the usual start of colour change (Senescence)
+    and leaves-down (Dormancy). The stage boundaries along f are set in
+    F.STAGE_BOUNDS and calibrated against well-known typical peak dates.
+    """
+    span = np.maximum(dorm - sen, 10.0)
+    f = (doy - sen) / span
+    b = F.STAGE_BOUNDS
+    xp = [b[0] - (b[1] - b[0])] + list(b) + [b[-1] + (b[-1] - b[-2])]
+    fp = [-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
+    return np.clip(np.interp(f, xp, fp), 0, 5).astype(np.float32), f
+
+
 def compute_season(today, base):
-    year = today.year
-    start = dt.date(year, 8, 1)
     week = today + dt.timedelta(days=7)
-    n = (week - start).days + 1
-    t = np.full((n, F.NROWS * F.NCOLS), np.nan, dtype=np.float32)
-    obs_through = None
-    if today > start:
-        obs = season_temps(year, min(today - dt.timedelta(days=1), dt.date(year, 12, 31)))
-        t[:obs.shape[0]] = obs
-        good = np.isfinite(obs).mean(axis=1) > 0.5
-        if good.any():
-            obs_through = start + dt.timedelta(days=int(np.nonzero(good)[0].max()))
-    fc_dates = [today + dt.timedelta(days=k) for k in range(8)]
-    fc, cycle = nbm_daily_means(fc_dates)
-    for d, v in fc.items():
-        i = (d - start).days
-        if 0 <= i < n:
-            t[i] = v
-    # Days between the last observation and the forecast: carry the last good day forward
-    for i in range(1, n):
-        bad = ~np.isfinite(t[i]); t[i][bad] = t[i - 1][bad]
-    S = F.accumulate(np.nan_to_num(t, nan=F.TBASE), F.START_DOY)
-    i_now = (today - start).days if today >= start else -1
-    i_week = n - 1
-    def stage_at(i):
-        if i < 0:
-            return np.zeros(S.shape[1], dtype=np.float32)
-        return F.stage_value(S[i], base["thr_sen"], base["thr_mid"], base["thr_dorm"]).astype(np.float32)
-    st_now, st_week = stage_at(i_now), stage_at(i_week)
-    has = np.isfinite(base["thr_mid"])
+    d = season_dates(today)
+    def doy(x):
+        return (x - dt.date(x.year, 1, 1)).days + 1
+    st_now, _ = stage_from_dates(doy(today), d["sen"], d["mid"], d["dorm"])
+    st_week, _ = stage_from_dates(doy(week), d["sen"], d["mid"], d["dorm"])
+    ok = d["land"] & np.isfinite(d["sen"]) & np.isfinite(d["dorm"])
     return {
-        "stage_now": np.where(has, st_now, np.nan).astype(np.float16),
-        "stage_week": np.where(has, st_week, np.nan).astype(np.float16),
+        "stage_now": np.where(ok, st_now, np.nan).astype(np.float16),
+        "stage_week": np.where(ok, st_week, np.nan).astype(np.float16),
         "now_date": np.array(today.isoformat()), "week_date": np.array(week.isoformat()),
-        "obs_through": np.array(obs_through.isoformat() if obs_through else ""),
-        "nbm_cycle": np.array(cycle or ""),
-        "version": np.array(f"{today.isoformat()}-{cycle or 'nofc'}"),
+        "obs_through": np.array(""), "nbm_cycle": np.array(""),
+        "version": np.array(f"v2-{today.isoformat()}-{','.join(str(x) for x in F.STAGE_BOUNDS)}"),
     }
 
 

@@ -152,6 +152,16 @@ def tile_foliage(version, which, z, x, y):
     return _png_response(png, cache_seconds=6 * 3600)
 
 
+@app.route("/meta/foliage/point")
+def meta_foliage_point():
+    from flask import request
+    try:
+        lat = float(request.args.get("lat")); lon = float(request.args.get("lon"))
+        return _meta_response(foliage_renderer.point(lat, lon))
+    except Exception as e:
+        return _meta_response({"error": f"{type(e).__name__}: {e}"})
+
+
 @app.route("/meta/foliage")
 def meta_foliage():
     try:

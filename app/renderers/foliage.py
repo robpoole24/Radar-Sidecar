@@ -52,7 +52,11 @@ PSTART = 14.0         # hours: accumulation starts once days are shorter than th
 START_DOY = 213       # Aug 1 (Jul 31 in leap years — immaterial)
 END_DOY = 366         # through Dec 31
 NDAYS = END_DOY - START_DOY + 1
-MIN_DECIDUOUS = 0.12  # cells with less deciduous/mixed forest than this aren't drawn
+MIN_DECIDUOUS = 0.12  # (baseline build only) cells with less forest than this get no satellite dates
+# Where the stage boundaries fall between the usual start of colour change (0)
+# and leaves-down (1): Little|Low, Low|Moderate, Moderate|High, High|Peak, Peak|Past.
+# Override with FOLIAGE_STAGE_BOUNDS="0.05,0.25,0.42,0.58,0.80" while calibrating.
+STAGE_BOUNDS = [float(x) for x in os.environ.get("FOLIAGE_STAGE_BOUNDS", "0.05,0.25,0.42,0.58,0.80").split(",")]
 
 def daylength_hours(lat_deg, doy):
     """Astronomical day length (hours) for latitudes (array) and a day of year."""
@@ -135,7 +139,7 @@ _compute_lock = threading.Lock()
 _compute_state = {"running": False, "last_try": 0, "error": None}
 
 def _latest_season_file():
-    files = sorted(f for f in os.listdir(data_dir()) if f.startswith("season-") and f.endswith(".npz"))
+    files = sorted(f for f in os.listdir(data_dir()) if f.startswith("season2-") and f.endswith(".npz"))
     return os.path.join(data_dir(), files[-1]) if files else None
 
 def _compute_today():
@@ -146,12 +150,12 @@ def _compute_today():
             return
         today = dt.datetime.utcnow().date()
         data = FD.compute_season(today, base)
-        tmp = os.path.join(data_dir(), f"season-{today.isoformat()}.tmp.npz")
+        tmp = os.path.join(data_dir(), f"season2-{today.isoformat()}.tmp.npz")
         np.savez_compressed(tmp, **data)
-        os.replace(tmp, os.path.join(data_dir(), f"season-{today.isoformat()}.npz"))
-        cutoff = f"season-{(today - dt.timedelta(days=7)).isoformat()}"
+        os.replace(tmp, os.path.join(data_dir(), f"season2-{today.isoformat()}.npz"))
+        cutoff = f"season2-{(today - dt.timedelta(days=7)).isoformat()}"
         for f in os.listdir(data_dir()):
-            if f.startswith("season-") and f < cutoff:
+            if f.startswith("season2-") and f < cutoff:
                 try: os.unlink(os.path.join(data_dir(), f))
                 except OSError: pass
         _compute_state["error"] = None
@@ -167,7 +171,7 @@ def ensure_today():
     if load_baseline() is None:
         return
     today = dt.datetime.utcnow().date().isoformat()
-    if os.path.exists(os.path.join(data_dir(), f"season-{today}.npz")):
+    if os.path.exists(os.path.join(data_dir(), f"season2-{today}.npz")):
         return
     with _compute_lock:
         if _compute_state["running"] or time.time() - _compute_state["last_try"] < 1800:
@@ -208,19 +212,15 @@ def render_tile(which, z, x, y):
     if lat2d.max() < LAT_S or lat2d.min() > LAT_N or lon2d.max() < LON_W or lon2d.min() > LON_E:
         return empty_tile_png(), True
     stage = data["stage_" + which].reshape(NROWS, NCOLS).astype(np.float32)
-    frac = base["decid"].reshape(NROWS, NCOLS).astype(np.float32)
     v = _bilinear(stage, lat2d, lon2d)
-    f = _bilinear(np.where(np.isfinite(stage), frac, np.nan), lat2d, lon2d)
-    show = np.isfinite(v) & np.isfinite(f) & (f >= MIN_DECIDUOUS)
+    show = np.isfinite(v)
     if not show.any():
         return empty_tile_png(), True
     k = np.clip(np.rint(np.nan_to_num(v)), 0, len(STAGES) - 1).astype(np.int64)
     cols = np.array([c for _, c in STAGES], dtype=np.uint8)
     rgba = np.zeros(lat2d.shape + (4,), dtype=np.uint8)
     rgba[..., :3] = cols[k]
-    # more forest → stronger colour (thin woodland stays faint)
-    alpha = np.clip(110 + (f - MIN_DECIDUOUS) * 300, 110, 205)
-    rgba[..., 3] = np.where(show, alpha, 0).astype(np.uint8)
+    rgba[..., 3] = np.where(show, 175, 0).astype(np.uint8)   # every US land cell, one even shade
     return rgba_to_png(rgba), True
 
 # ── Meta ─────────────────────────────────────────────────────────────────────
@@ -254,3 +254,22 @@ def meta():
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
     return out
+
+
+def point(lat, lon):
+    """Usual dates + today's stage for one spot (for calibrating STAGE_BOUNDS)."""
+    from . import foliage_data as FD
+    i = int(cell_index(np.array([lat]), np.array([lon]))[0])
+    if i < 0:
+        return {"error": "outside the map"}
+    today = dt.datetime.utcnow().date()
+    d = FD.season_dates(today)
+    nm = FD._normals()
+    doy = (today - dt.date(today.year, 1, 1)).days + 1
+    st, f = FD.stage_from_dates(doy, d["sen"][i:i + 1], d["mid"][i:i + 1], d["dorm"][i:i + 1])
+    cal = lambda v: None if not np.isfinite(v) else (dt.date(today.year, 1, 1) + dt.timedelta(days=int(round(float(v))) - 1)).strftime("%b %d")
+    base = load_baseline()
+    return {"lat": lat, "lon": lon, "land": bool(d["land"][i]), "forestShare": round(float(base["decid"][i]), 2) if base is not None else None,
+            "satelliteCell": bool(np.isfinite(nm["mid"][i])),
+            "usual": {"colorStarts": cal(d["sen"][i]), "halfGreenGone": cal(d["mid"][i]), "leavesDown": cal(d["dorm"][i])},
+            "f": round(float(f[0]), 3), "stageNow": STAGES[int(np.clip(round(float(st[0])), 0, 5))][0], "bounds": STAGE_BOUNDS}
