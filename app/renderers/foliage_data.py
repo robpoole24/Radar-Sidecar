@@ -110,7 +110,11 @@ def read_sds(path, name, band=None):
     finally:
         f.end()
     if band is not None and a.ndim == 3:
-        a = a[band]
+        # MCD12Q2 keeps its two growing-season "modes" on whichever axis is short:
+        # (2, 2400, 2400) or (2400, 2400, 2)
+        a = a[band] if a.shape[0] <= 4 else a[..., band]
+    if a.ndim != 2 or a.shape[0] != a.shape[1]:
+        raise ValueError(f"{name}: unexpected shape {a.shape}")
     return a
 
 
