@@ -209,7 +209,7 @@ def _s3():
 
 def nclim_key(year, month):
     s3 = _s3()
-    prefix = f"v1-0-0/grids/{year}/"
+    prefix = f"access/grids/{year}/"        # e.g. access/grids/2015/ncdd-201510-grd-scaled.nc
     keys = []
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=NCLIM_BUCKET, Prefix=prefix):
         keys += [c["Key"] for c in page.get("Contents", [])]
@@ -290,6 +290,8 @@ def step_cold(year):
         return np.load(out)
     _set_status(f"temperatures {year}", "NOAA nClimGrid Aug–Dec")
     t = season_temps(year)
+    if np.isfinite(t).mean() < 0.05:
+        raise RuntimeError(f"no NOAA nClimGrid temperatures found for {year}")
     # Fill short gaps (a missing day) with the previous day so totals don't stall
     for i in range(1, t.shape[0]):
         bad = ~np.isfinite(t[i]); t[i][bad] = t[i - 1][bad]
@@ -398,7 +400,7 @@ def build():
     years = _years()
     try:
         decid = step_landcover(token)
-        done_years = []
+        done_years, problems = [], {}
         for y in years:
             try:
                 step_phenology(token, y)
@@ -407,9 +409,12 @@ def build():
             except PermissionError:
                 raise
             except Exception as e:
-                _log(f"year {y} skipped: {type(e).__name__}: {e}")
+                problems[str(y)] = f"{type(e).__name__}: {e}"[:200]
+                _status["year_problems"] = problems
+                _log(f"year {y} skipped: {problems[str(y)]}")
         if len(done_years) < 4:
-            raise RuntimeError(f"only {len(done_years)} usable years")
+            first = next(iter(problems.items()), ("", ""))
+            raise RuntimeError(f"only {len(done_years)} usable years (e.g. {first[0]}: {first[1]})")
         summary = step_calibrate(decid, done_years)
         _set_status("done", json.dumps(summary.get("overall")), done=True)
         _log("baseline ready: " + json.dumps(summary.get("overall")))
