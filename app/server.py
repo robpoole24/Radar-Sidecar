@@ -24,6 +24,7 @@ from .renderers import models as model_renderer
 from .renderers import meso as meso_renderer
 from .renderers import ptype as ptype_renderer
 from .renderers import foliage as foliage_renderer
+from .renderers import hodograph as hodograph_renderer
 from .tileutil import empty_tile_png
 
 app = Flask(__name__)
@@ -185,6 +186,24 @@ def _auto_build():
         print(f"[foliage] could not start build: {e}", flush=True)
 import threading as _th
 _th.Timer(45, _auto_build).start()
+
+
+@app.route("/meta/hodograph")
+def meta_hodograph():
+    """Wind profile + severe-weather numbers for one point: ?lat=&lon=&fh=0"""
+    from flask import request
+    try:
+        lat = float(request.args.get("lat")); lon = float(request.args.get("lon"))
+        fh = int(request.args.get("fh", 0))
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            raise ValueError("lat/lon out of range")
+        out = hodograph_renderer.point(round(lat, 3), round(lon, 3), fh)
+    except Exception as e:
+        print(f"[meta/hodograph] {type(e).__name__}: {e}", flush=True)
+        out = {"status": "error", "error": "Couldn't read that spot."}
+    resp = _meta_response(out)
+    resp.headers["Cache-Control"] = "public, max-age=300" if out.get("status") == "ok" else "no-store"
+    return resp
 
 
 @app.route("/meta/ptype")
