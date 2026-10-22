@@ -48,7 +48,9 @@ TOP = 10000.0                     # m — highest point drawn
 FIELDS = ([("U", p) for p in P_LEVELS] + [("V", p) for p in P_LEVELS] + [("Z", p) for p in P_LEVELS]
           + [("T", p) for p in P_LEVELS]
           + [("U10", 0), ("V10", 0), ("T2", 0), ("PSFC", 0), ("HSFC", 0),
-             ("MLCAPE", 0), ("MLCIN", 0), ("SBCAPE", 0), ("LCL", 0)])
+             ("MLCAPE", 0), ("MLCIN", 0), ("SBCAPE", 0), ("LCL", 0),
+             # HRRR's own answers, for the tester self-check
+             ("H_SRH1", 0), ("H_SRH3", 0), ("H_USH6", 0), ("H_VSH6", 0), ("H_UST", 0), ("H_VST", 0)])
 _IDX = {f: i for i, f in enumerate(FIELDS)}
 _SOURCE = {   # field -> (file, VAR, level text in the .idx)
     **{("U", p): ("prs", "UGRD", f"{p} mb") for p in P_LEVELS},
@@ -57,6 +59,12 @@ _SOURCE = {   # field -> (file, VAR, level text in the .idx)
     **{("T", p): ("prs", "TMP", f"{p} mb") for p in P_LEVELS},
     ("T2", 0): ("prs", "TMP", "2 m above ground"),
     ("SBCAPE", 0): ("sfc", "CAPE", "surface"),
+    ("H_SRH1", 0): ("sfc", "HLCY", "1000-0 m above ground"),
+    ("H_SRH3", 0): ("sfc", "HLCY", "3000-0 m above ground"),
+    ("H_USH6", 0): ("sfc", "VUCSH", "0-6000 m above ground"),
+    ("H_VSH6", 0): ("sfc", "VVCSH", "0-6000 m above ground"),
+    ("H_UST", 0): ("sfc", "USTM", "0-6000 m above ground"),
+    ("H_VST", 0): ("sfc", "VSTM", "0-6000 m above ground"),
     ("U10", 0): ("prs", "UGRD", "10 m above ground"),
     ("V10", 0): ("prs", "VGRD", "10 m above ground"),
     ("PSFC", 0): ("prs", "PRES", "surface"),
@@ -65,7 +73,9 @@ _SOURCE = {   # field -> (file, VAR, level text in the .idx)
     ("MLCIN", 0): ("sfc", "CIN", "90-0 mb above ground"),
     ("LCL", 0): ("sfc", "HGT", "level of adiabatic condensation from sfc"),
 }
-OPTIONAL = {("MLCAPE", 0), ("MLCIN", 0), ("SBCAPE", 0), ("LCL", 0), ("T2", 0)} | {("T", p) for p in P_LEVELS}
+OPTIONAL = ({("MLCAPE", 0), ("MLCIN", 0), ("SBCAPE", 0), ("LCL", 0), ("T2", 0)} | {("T", p) for p in P_LEVELS}
+            | {("H_SRH1", 0), ("H_SRH3", 0), ("H_USH6", 0), ("H_VSH6", 0), ("H_UST", 0), ("H_VST", 0)})
+CUBE_VERSION = "v2"             # bump when FIELDS changes, so old files aren't misread
 
 
 def _dir():
@@ -117,7 +127,7 @@ _last_use = {"t": 0.0}
 
 
 def _paths(cycle, fh):
-    base = os.path.join(_dir(), f"{cycle}_f{fh:02d}")
+    base = os.path.join(_dir(), f"{cycle}_f{fh:02d}_{CUBE_VERSION}")
     return base + ".npy", base + ".json"
 
 
@@ -241,7 +251,7 @@ def _sample(cycle, fh, lat, lon):
         lam = (np.radians(lon) - m["p"]["lam0"] + np.pi) % (2 * np.pi) - np.pi
         a = m["p"]["n"] * lam
         ca, sa = np.cos(a), np.sin(a)
-        for uk, vk in [(("U", p), ("V", p)) for p in P_LEVELS] + [(("U10", 0), ("V10", 0))]:
+        for uk, vk in [(("U", p), ("V", p)) for p in P_LEVELS] + [(("U10", 0), ("V10", 0)), (("H_USH6", 0), ("H_VSH6", 0)), (("H_UST", 0), ("H_VST", 0))]:
             u, v = f[uk], f[vk]
             f[uk], f[vk] = ca * u + sa * v, -sa * u + ca * v
     hs, ps = f[("HSFC", 0)], f[("PSFC", 0)]
@@ -256,7 +266,9 @@ def _sample(cycle, fh, lat, lon):
             if np.isfinite(f[("T", p)]):
                 temps.append((h, f[("T", p)] - 273.15))
     return {"levels": levels, "temps": temps, "mlcape": f[("MLCAPE", 0)], "mlcin": f[("MLCIN", 0)],
-            "sbcape": f[("SBCAPE", 0)], "lcl": f[("LCL", 0)], "psfc": ps, "hsfc": hs}
+            "sbcape": f[("SBCAPE", 0)], "lcl": f[("LCL", 0)], "psfc": ps, "hsfc": hs,
+            "hrrr": {"srh1": f[("H_SRH1", 0)], "srh3": f[("H_SRH3", 0)], "ush6": f[("H_USH6", 0)], "vsh6": f[("H_VSH6", 0)],
+                     "ust": f[("H_UST", 0)], "vst": f[("H_VST", 0)]}}
 
 
 # ── Open-Meteo (outside the HRRR domain) ─────────────────────────────────────
@@ -497,10 +509,59 @@ def analyze(levels, extra):
 
 
 # ── Public entry point ───────────────────────────────────────────────────────
-def point(lat, lon, fh=0):
+def past_run(cycle):
+    """A specific HRRR run from NOAA's archive (testers): 'YYYYMMDDHH' within the last 30 days."""
+    try:
+        t = dt.datetime.strptime(cycle, "%Y%m%d%H")
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= (dt.datetime.utcnow() - t).total_seconds() <= 30 * 86400):
+        return None
+    if not M._exists(BUCKET, _key(cycle, 0, "prs") + ".idx"):
+        return None
+    top = 48 if t.hour % 6 == 0 else 18
+    return {"cycle": cycle, "hours": list(range(0, min(top, MAX_FH) + 1)), "past": True}
+
+
+def self_check(ours, h):
+    """Our numbers vs. the ones HRRR computes itself for the same spot and hour."""
+    if not h or not all(np.isfinite(h.get(k, np.nan)) for k in ("srh1", "srh3", "ush6", "vsh6")):
+        return None
+    hr_shear = round(float(np.hypot(h["ush6"], h["vsh6"])) * KT)
+    rows = []
+
+    def row(name, a, b, unit, tol_abs, tol_pct):
+        if a is None or b is None:
+            return
+        diff = abs(a - b)
+        ok = diff <= max(tol_abs, abs(b) * tol_pct)
+        rows.append({"name": name, "ours": a, "hrrr": b, "unit": unit, "ok": bool(ok)})
+    row("0–1 km SRH", ours["srh"]["0-1"], round(h["srh1"]), "m²/s²", 25, 0.25)
+    row("0–3 km SRH", ours["srh"]["0-3"], round(h["srh3"]), "m²/s²", 30, 0.25)
+    row("0–6 km shear", ours["shear"].get("0-6", {}).get("bulk"), hr_shear, "kt", 4, 0.10)
+    if ours.get("rm") and np.isfinite(h.get("ust", np.nan)):
+        st_kt = round(float(np.hypot(h["ust"], h["vst"])) * KT)
+        st_dir = int(round((np.degrees(np.arctan2(-h["ust"], -h["vst"])) + 360) % 360))
+        row("Storm motion speed", ours["rm"]["kt"], st_kt, "kt", 5, 0.15)
+        dd = abs((ours["rm"]["dir"] - st_dir + 180) % 360 - 180)
+        rows.append({"name": "Storm motion direction", "ours": ours["rm"]["dir"], "hrrr": st_dir, "unit": "°", "ok": bool(dd <= 20 or st_kt < 8)})
+    good = sum(r["ok"] for r in rows)
+    verdict = "match" if good == len(rows) else ("close" if good >= len(rows) - 1 else "check")
+    return {"rows": rows, "verdict": verdict,
+            "note": "HRRR's own values are computed on its native levels; ours from 25 mb pressure levels, so small differences are normal."}
+
+
+def point(lat, lon, fh=0, cycle=None, check=False):
     _last_use["t"] = time.time()
-    run = latest()
     fh = max(0, min(int(fh), MAX_FH))
+    if cycle:
+        run = past_run(cycle)
+        if not run:
+            return {"status": "error", "error": "That HRRR run isn't in NOAA's archive (use YYYYMMDDHH in UTC, within 30 days)."}
+        if not _inside_hrrr(lat, lon):
+            return {"status": "error", "error": "Past runs are HRRR only — pick a spot in the US."}
+    else:
+        run = latest()
     if run:
         fh = min(fh, run["hours"][-1])
         st = ensure(run["cycle"], fh)
@@ -511,7 +572,9 @@ def point(lat, lon, fh=0):
                 if out is None:
                     return {"status": "error", "error": "Not enough wind data at this spot."}
                 out.update(status="ok", source="HRRR", credit="NOAA HRRR", cycle=run["cycle"], fh=fh,
-                           hours=run["hours"], validIso=valid_iso(run["cycle"], fh), lat=lat, lon=lon)
+                           hours=run["hours"], validIso=valid_iso(run["cycle"], fh), lat=lat, lon=lon, past=bool(run.get("past")))
+                if check:
+                    out["check"] = self_check(out, prof.get("hrrr"))
                 return out
             # outside the HRRR domain: fall through to Open-Meteo
         elif st == "building" and _inside_hrrr(lat, lon):

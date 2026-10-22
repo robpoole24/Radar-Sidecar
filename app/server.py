@@ -8,6 +8,7 @@ Endpoints (all return 256x256 PNG, transparent where no data):
   GET /tiles/model/<model>/<cycle>/<fhour>/<z>/<x>/<y>.png   (rrfs | gfs | ecmwf)
   GET /meta/models          -> latest cycle + forecast hours for every model (JSON)
   GET /meta/rrfs            -> same, RRFS only (kept for compatibility)
+  GET /meta/hodograph?lat=&lon=&fh=  -> wind profile, shear, helicity, storm motion (JSON)
 
 Designed to sit behind the WeatherTV Node app. The Node app (or Leaflet
 directly) points tile layers here. If a render fails, a transparent tile is
@@ -203,6 +204,22 @@ def meta_hodograph():
         out = {"status": "error", "error": "Couldn't read that spot."}
     resp = _meta_response(out)
     resp.headers["Cache-Control"] = "public, max-age=300" if out.get("status") == "ok" else "no-store"
+    return resp
+
+
+# Testers: past HRRR runs + the self-check against HRRR's own numbers (DEBUG_KEY)
+@app.route("/meta/debug/hodograph")
+def meta_debug_hodograph():
+    from flask import request
+    try:
+        lat = float(request.args.get("lat")); lon = float(request.args.get("lon"))
+        fh = int(request.args.get("fh", 0))
+        cycle = request.args.get("cycle") or None
+        out = hodograph_renderer.point(round(lat, 3), round(lon, 3), fh, cycle=cycle, check=True)
+    except Exception as e:
+        out = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+    resp = _meta_response(out)
+    resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
