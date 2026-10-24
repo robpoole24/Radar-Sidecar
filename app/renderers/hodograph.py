@@ -131,63 +131,114 @@ def _paths(cycle, fh):
     return base + ".npy", base + ".json"
 
 
-def _uv_relative_to_grid(path):
+def _decode_message(buf):
+    """One GRIB2 message (bytes) -> 2-D array in file order, plus whether winds are grid-relative."""
+    import eccodes
+    h = eccodes.codes_new_from_message(buf)
     try:
-        import eccodes
-        with open(path, "rb") as f:
-            h = eccodes.codes_grib_new_from_file(f)
-            try:
-                return bool(eccodes.codes_get(h, "uvRelativeToGrid"))
-            finally:
-                eccodes.codes_release(h)
-    except Exception as e:
-        print(f"[hodograph] couldn't read uvRelativeToGrid ({e}); assuming grid-relative (HRRR default)", flush=True)
-        return True
+        ni, nj = eccodes.codes_get(h, "Ni"), eccodes.codes_get(h, "Nj")
+        vals = eccodes.codes_get_values(h).reshape(nj, ni)
+        try:
+            missing = eccodes.codes_get(h, "missingValue")
+            if eccodes.codes_get(h, "bitmapPresent"):
+                vals = np.where(vals == missing, np.nan, vals)
+        except Exception:
+            pass
+        try:
+            rel = bool(eccodes.codes_get(h, "uvRelativeToGrid"))
+        except Exception:
+            rel = None
+        return vals.astype("float32"), rel
+    finally:
+        eccodes.codes_release(h)
+
+
+def _chunks(wanted, max_gap=1_500_000, max_size=24_000_000):
+    """Group byte ranges that sit close together in the file into one download each."""
+    out = []
+    for field, (start, end) in sorted(wanted.items(), key=lambda kv: kv[1][0]):
+        if out and end is not None and out[-1]["end"] is not None and start - out[-1]["end"] <= max_gap \
+                and end - out[-1]["start"] <= max_size:
+            out[-1]["end"] = max(out[-1]["end"], end)
+            out[-1]["fields"].append((field, start, end))
+        else:
+            out.append({"start": start, "end": end, "fields": [(field, start, end)]})
+    return out
+
+
+def _fetch(kind_key, chunk):
+    rng = f"bytes={chunk['start']}-{chunk['end']}" if chunk["end"] is not None else f"bytes={chunk['start']}-"
+    return M._s3.get_object(Bucket=BUCKET, Key=kind_key, Range=rng)["Body"].read()
 
 
 def _build(cycle, fh):
+    """Fetch only the fields we need (a few merged byte-range downloads), decode them with
+    eccodes straight from memory, thin to ~9 km, and save one float16 cube. ~20-40 s."""
     t0 = time.time()
     idx = {kind: M._s3.get_object(Bucket=BUCKET, Key=_key(cycle, fh, kind) + ".idx")["Body"].read().decode("utf-8", "replace")
            for kind in ("prs", "sfc")}
-    info = {"grid": None, "rel": True}
-
-    def one(field):
+    wanted = {"prs": {}, "sfc": {}}
+    for field in FIELDS:
         kind, var, level = _SOURCE[field]
         rng = H._field_range(idx[kind], var, level)
-        if not rng:
-            if field in OPTIONAL:
-                return field, None
+        if rng:
+            wanted[kind][field] = rng
+        elif field not in OPTIONAL:
             raise KeyError(f"{var}:{level} not in HRRR {kind} index")
-        path = M._download_range(BUCKET, _key(cycle, fh, kind), rng)
-        if field == ("U", 850):
-            info["rel"] = _uv_relative_to_grid(path)
-        vals, grid = M._decode(path, [{}])
-        if info["grid"] is None:
-            info["grid"] = grid
-        thin = vals[::STRIDE, ::STRIDE]
-        if field == ("PSFC", 0):
-            thin = thin / 100.0                            # Pa -> hPa (float16 can't hold 100000)
-        return field, thin.astype("float16")
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        results = dict(ex.map(one, FIELDS))
-    g = info["grid"]
-    if not g or g.get("type") != "lcc":
-        raise RuntimeError(f"unexpected HRRR grid type {g and g.get('type')}")
-    shape = next(v.shape for v in results.values() if v is not None)
+    jobs = [(kind, c) for kind in ("prs", "sfc") for c in _chunks(wanted[kind])]
+    results, info = {}, {"rel": None, "grid": None, "check": None}
+    lock = threading.Lock()
+
+    def run(job):
+        kind, chunk = job
+        data = _fetch(_key(cycle, fh, kind), chunk)
+        for field, start, end in chunk["fields"]:
+            buf = data[start - chunk["start"]: (end - chunk["start"] + 1) if end is not None else None]
+            vals, rel = _decode_message(buf)
+            if field == ("U", 850):
+                info["rel"] = rel
+                info["check"] = (buf, vals)
+            thin = vals[::STRIDE, ::STRIDE]
+            if field == ("PSFC", 0):
+                thin = thin / 100.0                            # Pa -> hPa (float16 can't hold 100000)
+            with lock:
+                results[field] = thin.astype("float16")
+        del data
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        list(ex.map(run, jobs))
+    t_dl = time.time() - t0
+
+    # The grid's projection (once), and a check that our fast decode lines up with it
+    buf, fast = info["check"]
+    import tempfile
+    tf = tempfile.NamedTemporaryFile(suffix=".grib2", delete=False); tf.write(buf); tf.close()
+    ref, grid = M._decode(tf.name, [{}])
+    if ref.shape != fast.shape or not np.allclose(np.nan_to_num(ref), np.nan_to_num(fast), atol=1e-3):
+        if ref.shape == fast.shape and np.allclose(np.nan_to_num(ref), np.nan_to_num(fast[::-1]), atol=1e-3):
+            print("[hodograph] decoded rows were upside down; flipping", flush=True)
+            for k in results:
+                results[k] = results[k][::-1]
+        else:
+            raise RuntimeError("fast GRIB decode doesn't match the reference decode")
+    if not grid or grid.get("type") != "lcc":
+        raise RuntimeError(f"unexpected HRRR grid type {grid and grid.get('type')}")
+    rel = True if info["rel"] is None else info["rel"]
+
+    shape = next(iter(results.values())).shape
     cube = np.full((len(FIELDS),) + shape, np.nan, dtype="float16")
     for f, v in results.items():
-        if v is not None:
-            cube[_IDX[f]] = v
+        cube[_IDX[f]] = v
     npy, meta = _paths(cycle, fh)
     np.save(npy + ".tmp.npy", cube)
     os.replace(npy + ".tmp.npy", npy)
     with open(meta, "w") as fp:
-        json.dump({"cycle": cycle, "fh": fh, "stride": STRIDE, "rel": info["rel"],
-                   "grid": {k: g[k] for k in ("x1", "y1", "dx", "dy", "ny", "nx")}, "p": g["p"],
+        json.dump({"cycle": cycle, "fh": fh, "stride": STRIDE, "rel": rel,
+                   "grid": {k: grid[k] for k in ("x1", "y1", "dx", "dy", "ny", "nx")}, "p": grid["p"],
                    "built": time.time(), "seconds": round(time.time() - t0, 1)}, fp)
     print(f"[hodograph] built HRRR {cycle} f{fh:02d} in {time.time() - t0:.0f}s "
-          f"({cube.nbytes / 1e6:.0f} MB on disk, uv grid-relative={info['rel']})", flush=True)
+          f"(download+decode {t_dl:.0f}s, {len(jobs)} downloads, {cube.nbytes / 1e6:.0f} MB, uv grid-relative={rel})", flush=True)
 
 
 def _run_build(cycle, fh):
@@ -209,8 +260,8 @@ def ensure(cycle, fh):
         return "ready"
     with _state_lock:
         s = _state.get((cycle, fh))
-        if s and s["status"] == "building":
-            return "building"
+        if s and s["status"] == "building" and time.time() - s["at"] < 300:
+            return "building"                      # (older than 5 min = the build died; start over)
         if s and s["status"] == "failed" and time.time() - s["at"] < 300:
             return "failed: " + s["error"]
         _state[(cycle, fh)] = {"status": "building", "at": time.time()}
@@ -565,14 +616,21 @@ def point(lat, lon, fh=0, cycle=None, check=False):
     if run:
         fh = min(fh, run["hours"][-1])
         st = ensure(run["cycle"], fh)
+        use = (run["cycle"], fh) if st == "ready" else None
+        if use is None and not run.get("past"):
+            use = _older_ready(run["cycle"], fh)          # same valid time from an earlier run, while this one loads
+            if use:
+                st = "ready"
         if st == "ready":
-            prof = _sample(run["cycle"], fh, lat, lon)
+            prof = _sample(use[0], use[1], lat, lon)
             if prof is not None:
                 out = analyze(prof["levels"], prof)
                 if out is None:
                     return {"status": "error", "error": "Not enough wind data at this spot."}
                 out.update(status="ok", source="HRRR", credit="NOAA HRRR", cycle=run["cycle"], fh=fh,
                            hours=run["hours"], validIso=valid_iso(run["cycle"], fh), lat=lat, lon=lon, past=bool(run.get("past")))
+                if use[0] != run["cycle"]:
+                    out.update(fromCycle=use[0], newerLoading=True, retryAfter=20)
                 if check:
                     out["check"] = self_check(out, prof.get("hrrr"))
                 return out
@@ -594,31 +652,48 @@ def point(lat, lon, fh=0, cycle=None, check=False):
         return {"status": "error", "error": f"Wind data unavailable ({type(e).__name__})."}
 
 
+def _older_ready(cycle, fh):
+    """An already-built hour from the previous 1-3 runs that is valid at the same time (cycle-1h f+1, …)."""
+    t = dt.datetime.strptime(cycle, "%Y%m%d%H")
+    for back in (1, 2, 3):
+        c, f = (t - dt.timedelta(hours=back)).strftime("%Y%m%d%H"), fh + back
+        if f <= 48 and all(os.path.exists(x) for x in _paths(c, f)):
+            return c, f
+    return None
+
+
 def _inside_hrrr(lat, lon):
     return 21.0 <= lat <= 53.0 and -134.0 <= lon <= -60.0
 
 
-# ── Upkeep: prebuild the newest hour while people are using it; tidy disk ───
+# ── Upkeep: always have "now" ready for the newest run; tidy disk ────────────
+KEEP_RUNS = 2
+
+
 def _upkeep():
+    time.sleep(20)
     while True:
-        time.sleep(300)
         try:
-            if time.time() - _last_use["t"] < 2 * 3600:
-                run = latest()
-                if run:
-                    ensure(run["cycle"], 0)
-            # Keep the newest run; older runs go after 90 minutes (each hour is ~30 MB)
+            _runs.pop("r", None)                   # look for a new run every pass
             run = latest()
-            cutoff = time.time() - 90 * 60
-            for name in os.listdir(_dir()):
-                p = os.path.join(_dir(), name)
-                if (not run or not name.startswith(run["cycle"])) and os.path.getmtime(p) < cutoff:
-                    try:
-                        os.unlink(p)
-                    except OSError:
-                        pass
+            if run:
+                ensure(run["cycle"], 0)            # "now" for every new run, used or not (~30 s of work an hour)
+                if time.time() - _last_use["t"] < 2 * 3600 and 1 in run["hours"]:
+                    ensure(run["cycle"], 1)        # people are looking: have the next hour waiting too
+                # Keep the newest runs (the older one is the stand-in while a new run builds)
+                t = dt.datetime.strptime(run["cycle"], "%Y%m%d%H")
+                keep = {(t - dt.timedelta(hours=b)).strftime("%Y%m%d%H") for b in range(KEEP_RUNS)}
+                cutoff = time.time() - 30 * 60
+                for name in os.listdir(_dir()):
+                    p = os.path.join(_dir(), name)
+                    if name[:10] not in keep and os.path.getmtime(p) < cutoff:
+                        try:
+                            os.unlink(p)
+                        except OSError:
+                            pass
         except Exception as e:
             print(f"[hodograph] upkeep: {e}", flush=True)
+        time.sleep(120)
 
 
 threading.Thread(target=_upkeep, daemon=True).start()
