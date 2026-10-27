@@ -619,7 +619,222 @@ def stage_from_dates(doy, sen, mid, dorm):
     return np.clip(np.interp(f, xp, fp), 0, 5).astype(np.float32), f
 
 
+# ── Peak-date model (Oct 27 2026) ────────────────────────────────────────────
+# The satellite greenness dates above turned out to be nearly the same all over
+# the country (half-green-gone ≈ Oct 5 from Minnesota to Houston), so by late
+# October the whole map read "past peak". Leaf colour actually follows the
+# weather: it peaks once enough cool, short days have built up after summer
+# (the Delpierre cold sum the build already computed for 2013–2023).
+#
+#   usual peak   first day the place's NORMAL cold sum reaches the peak level K
+#   K            set so that well-known typical peak dates come out right
+#                (fitted against latitude — see PEAK_ANCHORS), so the north /
+#                south and mountain / valley pattern comes from real temperatures
+#   this year    observed temperatures since Aug 1 (NOAA nClimGrid) move the
+#                peak earlier or later by how far ahead of / behind normal this
+#                season's cold sum is (limited to ±12 days)
+#   stage        days before / after the peak (PEAK_OFFSETS)
+
+# Typical peak (lat, lon, month, day). Widely published averages, not one year.
+PEAK_ANCHORS = [
+    ("N. Minnesota (Ely)",        47.9,  -91.9,  9, 27),
+    ("Duluth",                    46.8,  -92.1,  9, 30),
+    ("Upper Peninsula (Marquette)", 46.5, -87.4, 10,  1),
+    ("Adirondacks",               44.1,  -74.2, 10,  1),
+    ("N. Vermont",                44.5,  -72.6, 10,  4),
+    ("White Mtns, NH",            44.2,  -71.4, 10,  5),
+    ("N. Wisconsin (Rhinelander)", 45.6, -89.4, 10,  2),
+    ("Madison, WI",               43.1,  -89.4, 10, 14),
+    ("Green Bay, WI",             44.5,  -88.0, 10, 10),
+    ("Grand Rapids, MI",          43.0,  -85.7, 10, 15),
+    ("Catskills",                 42.1,  -74.4, 10, 10),
+    ("Hartford, CT",              41.8,  -72.7, 10, 20),
+    ("Boston",                    42.4,  -71.3, 10, 22),
+    ("Chicago",                   41.9,  -87.9, 10, 20),
+    ("Pocono Mtns",               41.1,  -75.3, 10, 12),
+    ("Pittsburgh",                40.4,  -80.0, 10, 20),
+    ("Columbus, OH",              40.0,  -83.0, 10, 22),
+    ("Indianapolis",              39.8,  -86.2, 10, 22),
+    ("Shenandoah NP",             38.5,  -78.5, 10, 20),
+    ("Washington, DC",            38.9,  -77.0, 10, 30),
+    ("St. Louis",                 38.6,  -90.4, 10, 28),
+    ("Louisville",                38.2,  -85.7, 10, 28),
+    ("Asheville / Blue Ridge",    35.6,  -82.6, 10, 22),
+    ("Great Smoky Mtns (Gatlinburg)", 35.7, -83.5, 10, 28),
+    ("Ozarks (Harrison, AR)",     36.2,  -93.1, 10, 30),
+    ("Nashville",                 36.2,  -86.8, 11,  1),
+    ("Raleigh",                   35.8,  -78.6, 11,  2),
+    ("Atlanta",                   33.8,  -84.4, 11,  7),
+    ("Birmingham, AL",            33.5,  -86.8, 11,  8),
+    ("Dallas",                    32.8,  -96.8, 11, 18),
+    ("Denver foothills (aspen)",  39.7, -105.5,  9, 25),
+    ("Aspen, CO",                 39.2, -106.8,  9, 24),
+    ("Boise",                     43.6, -116.2, 10, 20),
+    ("Portland, OR",              45.5, -122.7, 10, 28),
+    ("Seattle",                   47.6, -122.3, 10, 28),
+]
+# Stage boundaries in days from the peak: Little|Low, Low|Moderate, Moderate|High, High|Peak, Peak|Past.
+PEAK_OFFSETS = [float(x) for x in os.environ.get("FOLIAGE_PEAK_OFFSETS", "-28,-18,-9,-4,8").split(",")]
+MAX_SHIFT = float(os.environ.get("FOLIAGE_MAX_SHIFT_DAYS", "12"))
+
+
+def normal_cold():
+    """Average accumulated-cold curve per cell over the build years: (days, cells) float32."""
+    path = _path("normal-cold.npy")
+    if os.path.exists(path):
+        return np.load(path).astype(np.float32)
+    files = sorted(f for f in os.listdir(F.data_dir()) if re.fullmatch(r"cold-\d{4}\.npy", f))
+    if not files:
+        raise RuntimeError("no cold-YYYY.npy files from the build")
+    tot = None; n = None
+    for f in files:
+        a = np.load(_path(f)).astype(np.float32)
+        ok = np.isfinite(a)
+        if tot is None:
+            tot = np.zeros(a.shape, np.float32); n = np.zeros(a.shape, np.float32)
+        m = min(a.shape[0], tot.shape[0])
+        tot[:m] += np.where(ok[:m], a[:m], 0); n[:m] += ok[:m]
+    out = np.where(n > 0, tot / np.maximum(n, 1), np.nan).astype(np.float32)
+    np.save(path, out.astype(np.float16))
+    return out
+
+
+def _doy(month, day, year=2026):
+    return (dt.date(year, month, day) - dt.date(year, 1, 1)).days + 1
+
+
+def _near_value(arr2d_flat, lat, lon, land):
+    """Median of a value over the 3x3 cells around a spot (land cells only)."""
+    i = int(F.cell_index(np.array([lat]), np.array([lon]))[0])
+    if i < 0:
+        return np.nan
+    r, c = divmod(i, F.NCOLS)
+    vals = []
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            rr, cc = r + dr, c + dc
+            if 0 <= rr < F.NROWS and 0 <= cc < F.NCOLS:
+                j = rr * F.NCOLS + cc
+                if land[j] and np.isfinite(arr2d_flat[j]):
+                    vals.append(arr2d_flat[j])
+    return float(np.median(vals)) if vals else np.nan
+
+
+def calibrate_peak(norm, land):
+    """Peak level K per cell (K = a + b·latitude, fitted to PEAK_ANCHORS) + a report."""
+    path = _path("peak-calibration.json")
+    lat_c = np.repeat(F.GRID_LAT, F.NCOLS)
+    rows = []
+    for name, la, lo, m, d in PEAK_ANCHORS:
+        i = (_doy(m, d) - F.START_DOY)
+        if not (0 <= i < norm.shape[0]):
+            continue
+        k = _near_value(norm[i], la, lo, land)
+        if np.isfinite(k) and k > 0:
+            rows.append((name, la, lo, _doy(m, d), k))
+    if len(rows) < 6:
+        raise RuntimeError(f"only {len(rows)} peak anchors usable")
+    la = np.array([r[1] for r in rows]); kk = np.array([r[4] for r in rows])
+    # Robust line fit (two passes: drop the worst 15% and refit)
+    b, a = np.polyfit(la, kk, 1)
+    res = np.abs(kk - (a + b * la))
+    keep = res <= np.quantile(res, 0.85)
+    b, a = np.polyfit(la[keep], kk[keep], 1)
+    K = np.maximum(a + b * lat_c, 1.0).astype(np.float32)
+    # Report: what the usual peak comes out as at each anchor
+    first = _first_day_reaching(norm, K)
+    rep = []
+    for name, lat0, lon0, want, k in rows:
+        got = _near_value(first, lat0, lon0, land)
+        rep.append({"place": name, "typical": (dt.date(2026, 1, 1) + dt.timedelta(days=want - 1)).strftime("%b %d"),
+                    "model": None if not np.isfinite(got) else (dt.date(2026, 1, 1) + dt.timedelta(days=int(round(got)) - 1)).strftime("%b %d"),
+                    "off_days": None if not np.isfinite(got) else int(round(got - want))})
+    offs = [abs(r["off_days"]) for r in rep if r["off_days"] is not None]
+    summary = {"anchors": len(rep), "mean_abs_days": round(float(np.mean(offs)), 1) if offs else None,
+               "within_7_days": round(100.0 * np.mean(np.array(offs) <= 7), 1) if offs else None,
+               "K": {"a": round(float(a), 2), "b_per_deg_lat": round(float(b), 3)}, "places": rep,
+               "built": dt.datetime.utcnow().isoformat() + "Z"}
+    with open(path, "w") as f:
+        json.dump(summary, f, indent=1)
+    return K, summary
+
+
+def this_year_shift(today, norm, K, land):
+    """Days earlier (−) / later (+) than usual this season is running, per cell (NaN if unknown)."""
+    try:
+        last = today - dt.timedelta(days=4)                 # nClimGrid's usual delay
+        if last < dt.date(today.year, 8, 20):
+            return None, None
+        t = season_temps(today.year, last)
+        good = np.isfinite(t)
+        # Use only days most of the country has; fill single gaps from the day before
+        days_ok = np.where(good.mean(axis=1) > 0.5)[0]
+        if not len(days_ok):
+            return None, None
+        t = t[: days_ok[-1] + 1]
+        for i in range(1, t.shape[0]):
+            bad = ~np.isfinite(t[i]); t[i][bad] = t[i - 1][bad]
+        obs = F.accumulate(np.nan_to_num(t, nan=25.0), F.START_DOY)          # NaN → warm day (adds nothing)
+        i0 = obs.shape[0] - 1
+        S0, N0 = obs[i0], norm[i0]
+        # Project the rest of the season as normal: S(d) = S0 + N(d) − N(i0)
+        proj = S0[None, :] + norm[i0:] - N0[None, :]
+        first_this = _first_day_reaching(np.concatenate([obs, proj[1:]], axis=0), K)
+        first_norm = _first_day_reaching(norm, K)
+        shift = np.clip(first_this - first_norm, -MAX_SHIFT, MAX_SHIFT)
+        through = (dt.date(today.year, 8, 1) + dt.timedelta(days=int(i0))).isoformat()
+        return np.where(land & np.isfinite(shift), shift, 0.0).astype(np.float32), through
+    except Exception as e:
+        print(f"[foliage] this-year temperatures unavailable: {type(e).__name__}: {e}", flush=True)
+        return None, None
+
+
+def stage_from_peak(doy, peak):
+    """0 Little · 1 Low · 2 Moderate · 3 High · 4 Peak · 5 Past peak, from days relative to the peak."""
+    b = PEAK_OFFSETS
+    d = np.where(np.isfinite(peak), doy - peak, -999.0)       # never peaks (south FL, S TX) → little colour
+    xp = [b[0] - (b[1] - b[0])] + list(b) + [b[-1] + (b[-1] - b[-2])]
+    fp = [-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
+    return np.clip(np.interp(d, xp, fp), 0, 5).astype(np.float32)
+
+
+def peak_dates(today):
+    """Usual + this year's peak day-of-year per cell, with the calibration report."""
+    land = us_land_mask(today.year)
+    norm = normal_cold()
+    K, cal = calibrate_peak(norm, land)
+    usual = _first_day_reaching(norm, K)
+    shift, through = this_year_shift(today, norm, K, land)
+    peak = usual + (shift if shift is not None else 0.0)
+    return {"land": land, "usual": usual, "peak": np.where(land, peak, np.nan), "shift": shift,
+            "through": through or "", "calibration": cal}
+
+
 def compute_season(today, base):
+    week = today + dt.timedelta(days=7)
+    def doy(x):
+        return (x - dt.date(x.year, 1, 1)).days + 1
+    try:
+        p = peak_dates(today)
+    except Exception as e:
+        # Build files missing: fall back to the satellite-date method
+        print(f"[foliage] peak model unavailable ({type(e).__name__}: {e}); using satellite dates", flush=True)
+        return _compute_season_satellite(today, base)
+    land = p["land"]
+    st_now = stage_from_peak(doy(today), p["peak"])
+    st_week = stage_from_peak(doy(week), p["peak"])
+    return {
+        "stage_now": np.where(land, st_now, np.nan).astype(np.float16),
+        "stage_week": np.where(land, st_week, np.nan).astype(np.float16),
+        "peak_doy": np.where(land, p["peak"], np.nan).astype(np.float32),
+        "usual_peak_doy": np.where(land, p["usual"], np.nan).astype(np.float32),
+        "now_date": np.array(today.isoformat()), "week_date": np.array(week.isoformat()),
+        "obs_through": np.array(p["through"]), "nbm_cycle": np.array(""),
+        "version": np.array(f"v3-{today.isoformat()}-{','.join(str(x) for x in PEAK_OFFSETS)}"),
+    }
+
+
+def _compute_season_satellite(today, base):
     week = today + dt.timedelta(days=7)
     d = season_dates(today)
     def doy(x):
@@ -634,6 +849,8 @@ def compute_season(today, base):
         "obs_through": np.array(""), "nbm_cycle": np.array(""),
         "version": np.array(f"v2-{today.isoformat()}-{','.join(str(x) for x in F.STAGE_BOUNDS)}"),
     }
+
+
 
 
 if __name__ == "__main__":

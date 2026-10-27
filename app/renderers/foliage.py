@@ -10,6 +10,12 @@ WeatherTV Fall Colors — our own leaf-color model, from public data only.
   This year's weather     NOAA nClimGrid-Daily (observed daily temperatures)
                           + NOAA National Blend of Models (next 7 days).
 
+Oct 27 2026: stages now come from each place's PEAK DATE — the day its
+accumulated cold (below) reaches a level fitted to well-known typical peak
+dates, moved earlier/later by this season's observed temperatures. See
+foliage_data.peak_dates. (The satellite greenness dates alone made the whole
+country "past peak" by late October.)
+
 Model (after Delpierre et al. 2009, "Modelling interannual and spatial
 variability of leaf senescence"): from Aug 1, each day adds "cold" when the
 day is shorter than PSTART hours —   R = max(0, TBASE − Tmean) · (daylength / PSTART).
@@ -139,7 +145,7 @@ _compute_lock = threading.Lock()
 _compute_state = {"running": False, "last_try": 0, "error": None}
 
 def _latest_season_file():
-    files = sorted(f for f in os.listdir(data_dir()) if f.startswith("season2-") and f.endswith(".npz"))
+    files = sorted(f for f in os.listdir(data_dir()) if f.startswith("season3-") and f.endswith(".npz"))
     return os.path.join(data_dir(), files[-1]) if files else None
 
 def _compute_today():
@@ -150,12 +156,12 @@ def _compute_today():
             return
         today = dt.datetime.utcnow().date()
         data = FD.compute_season(today, base)
-        tmp = os.path.join(data_dir(), f"season2-{today.isoformat()}.tmp.npz")
+        tmp = os.path.join(data_dir(), f"season3-{today.isoformat()}.tmp.npz")
         np.savez_compressed(tmp, **data)
-        os.replace(tmp, os.path.join(data_dir(), f"season2-{today.isoformat()}.npz"))
-        cutoff = f"season2-{(today - dt.timedelta(days=7)).isoformat()}"
+        os.replace(tmp, os.path.join(data_dir(), f"season3-{today.isoformat()}.npz"))
+        cutoff = f"season3-{(today - dt.timedelta(days=7)).isoformat()}"
         for f in os.listdir(data_dir()):
-            if f.startswith("season2-") and f < cutoff:
+            if (f.startswith("season3-") and f < cutoff) or f.startswith("season2-"):   # season2 = the old satellite-date maps
                 try: os.unlink(os.path.join(data_dir(), f))
                 except OSError: pass
         _compute_state["error"] = None
@@ -171,7 +177,7 @@ def ensure_today():
     if load_baseline() is None:
         return
     today = dt.datetime.utcnow().date().isoformat()
-    if os.path.exists(os.path.join(data_dir(), f"season2-{today}.npz")):
+    if os.path.exists(os.path.join(data_dir(), f"season3-{today}.npz")):
         return
     with _compute_lock:
         if _compute_state["running"] or time.time() - _compute_state["last_try"] < 1800:
@@ -243,10 +249,12 @@ def meta():
     if not base_ok:
         return out
     try:
-        bt = os.path.join(data_dir(), "backtest.json")
-        if os.path.exists(bt):
-            with open(bt) as f:
-                out["backtest"] = json.load(f).get("summary")
+        cal = os.path.join(data_dir(), "peak-calibration.json")
+        if os.path.exists(cal):
+            with open(cal) as f:
+                c = json.load(f)
+            # How close the usual peak comes out to well-known typical peak dates
+            out["calibration"] = {k: c.get(k) for k in ("anchors", "mean_abs_days", "within_7_days", "K", "built")}
         data = season_now()
         if data is not None:
             out.update(available=True, version=str(data["version"]), now=str(data["now_date"]), week=str(data["week_date"]),
@@ -257,19 +265,19 @@ def meta():
 
 
 def point(lat, lon):
-    """Usual dates + today's stage for one spot (for calibrating STAGE_BOUNDS)."""
+    """Usual + this year's peak and today's stage for one spot (for checking the model)."""
     from . import foliage_data as FD
     i = int(cell_index(np.array([lat]), np.array([lon]))[0])
     if i < 0:
         return {"error": "outside the map"}
+    data = season_now()
+    if data is None or "peak_doy" not in data:
+        return {"error": "this season isn't computed yet — try again in a few minutes"}
     today = dt.datetime.utcnow().date()
-    d = FD.season_dates(today)
-    nm = FD._normals()
-    doy = (today - dt.date(today.year, 1, 1)).days + 1
-    st, f = FD.stage_from_dates(doy, d["sen"][i:i + 1], d["mid"][i:i + 1], d["dorm"][i:i + 1])
     cal = lambda v: None if not np.isfinite(v) else (dt.date(today.year, 1, 1) + dt.timedelta(days=int(round(float(v))) - 1)).strftime("%b %d")
-    base = load_baseline()
-    return {"lat": lat, "lon": lon, "land": bool(d["land"][i]), "forestShare": round(float(base["decid"][i]), 2) if base is not None else None,
-            "satelliteCell": bool(np.isfinite(nm["mid"][i])),
-            "usual": {"colorStarts": cal(d["sen"][i]), "halfGreenGone": cal(d["mid"][i]), "leavesDown": cal(d["dorm"][i])},
-            "f": round(float(f[0]), 3), "stageNow": STAGES[int(np.clip(round(float(st[0])), 0, 5))][0], "bounds": STAGE_BOUNDS}
+    peak, usual = float(data["peak_doy"][i]), float(data["usual_peak_doy"][i])
+    st = float(data["stage_now"][i])
+    return {"lat": lat, "lon": lon, "usualPeak": cal(usual), "peakThisYear": cal(peak),
+            "daysVsUsual": None if not (np.isfinite(peak) and np.isfinite(usual)) else int(round(peak - usual)),
+            "stageNow": None if not np.isfinite(st) else STAGES[int(np.clip(round(st), 0, 5))][0],
+            "observedThrough": str(data["obs_through"]), "offsets": FD.PEAK_OFFSETS}
