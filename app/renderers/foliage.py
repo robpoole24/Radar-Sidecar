@@ -144,8 +144,16 @@ _season = {"path": None, "data": None}
 _compute_lock = threading.Lock()
 _compute_state = {"running": False, "last_try": 0, "error": None}
 
+def _tag():
+    """Today's file is tied to the stage settings, so changing FOLIAGE_PEAK_OFFSETS redraws the map at once."""
+    import hashlib
+    from . import foliage_data as FD
+    return hashlib.sha1(",".join(str(x) for x in FD.PEAK_OFFSETS).encode()).hexdigest()[:6]
+
 def _latest_season_file():
-    files = sorted(f for f in os.listdir(data_dir()) if f.startswith("season3-") and f.endswith(".npz"))
+    all3 = sorted(f for f in os.listdir(data_dir()) if f.startswith("season3-") and f.endswith(".npz") and ".tmp." not in f)
+    # This setting's newest day; while it's being computed, keep showing the last map
+    files = [f for f in all3 if f.endswith(f"-{_tag()}.npz")] or all3
     return os.path.join(data_dir(), files[-1]) if files else None
 
 def _compute_today():
@@ -156,12 +164,13 @@ def _compute_today():
             return
         today = dt.datetime.utcnow().date()
         data = FD.compute_season(today, base)
-        tmp = os.path.join(data_dir(), f"season3-{today.isoformat()}.tmp.npz")
+        tmp = os.path.join(data_dir(), f"season3-{today.isoformat()}-{_tag()}.tmp.npz")
         np.savez_compressed(tmp, **data)
-        os.replace(tmp, os.path.join(data_dir(), f"season3-{today.isoformat()}.npz"))
+        os.replace(tmp, os.path.join(data_dir(), f"season3-{today.isoformat()}-{_tag()}.npz"))
         cutoff = f"season3-{(today - dt.timedelta(days=7)).isoformat()}"
         for f in os.listdir(data_dir()):
-            if (f.startswith("season3-") and f < cutoff) or f.startswith("season2-"):   # season2 = the old satellite-date maps
+            old_tag = f.startswith("season3-") and not f.endswith(f"-{_tag()}.npz")
+            if (f.startswith("season3-") and f < cutoff) or old_tag or f.startswith("season2-"):   # season2 = the old satellite-date maps
                 try: os.unlink(os.path.join(data_dir(), f))
                 except OSError: pass
         _compute_state["error"] = None
@@ -177,7 +186,7 @@ def ensure_today():
     if load_baseline() is None:
         return
     today = dt.datetime.utcnow().date().isoformat()
-    if os.path.exists(os.path.join(data_dir(), f"season3-{today}.npz")):
+    if os.path.exists(os.path.join(data_dir(), f"season3-{today}-{_tag()}.npz")):
         return
     with _compute_lock:
         if _compute_state["running"] or time.time() - _compute_state["last_try"] < 1800:

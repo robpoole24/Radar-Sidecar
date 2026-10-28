@@ -674,7 +674,8 @@ PEAK_ANCHORS = [
     ("Seattle",                   47.6, -122.3, 10, 28),
 ]
 # Stage boundaries in days from the peak: Little|Low, Low|Moderate, Moderate|High, High|Peak, Peak|Past.
-PEAK_OFFSETS = [float(x) for x in os.environ.get("FOLIAGE_PEAK_OFFSETS", "-28,-18,-9,-4,8").split(",")]
+# Oct 27: widened after comparing with ExploreFall — colour builds later and peak lasts ~2 weeks.
+PEAK_OFFSETS = [float(x) for x in (os.environ.get("FOLIAGE_PEAK_OFFSETS") or "-22,-9,-4,0,15").split(",")]
 MAX_SHIFT = float(os.environ.get("FOLIAGE_MAX_SHIFT_DAYS", "12"))
 
 
